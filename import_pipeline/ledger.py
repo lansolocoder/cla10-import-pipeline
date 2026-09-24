@@ -1,4 +1,4 @@
-"""SQLite 持久化：来源配置与字段映射台账。
+"""SQLite 持久化：来源配置、字段映射与导入批次台账。
 
 仓库根目录下的 import_ledger.db 是唯一持久化载体，仅使用 sqlite3 标准库。
 """
@@ -31,6 +31,24 @@ CREATE TABLE IF NOT EXISTS field_mappings (
     target_column TEXT NOT NULL,
     PRIMARY KEY (source_name, source_column)
 );
+CREATE TABLE IF NOT EXISTS import_batches (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    batch_no INTEGER NOT NULL,
+    total_rows INTEGER NOT NULL,
+    success_count INTEGER NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    failed_count INTEGER NOT NULL,
+    new_count INTEGER NOT NULL,
+    PRIMARY KEY (source_name, batch_no)
+);
+CREATE TABLE IF NOT EXISTS imported_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    signature TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_imported_records_source
+    ON imported_records (source_name, signature);
 """
 
 
@@ -141,3 +159,87 @@ def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]
         " WHERE source_name = ? ORDER BY rowid",
         (source,),
     ).fetchall()
+
+
+def get_source_config(
+    conn: sqlite3.Connection, source: str
+) -> tuple[str, list[str], dict[str, str]]:
+    """返回来源的 (CSV 路径, 必需字段列表, {源列名: 目标列名})。
+
+    来源未注册时抛 LedgerError。
+    """
+    row = conn.execute(
+        "SELECT csv_path FROM sources WHERE name = ?", (source,)
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"来源不存在: {source}")
+    csv_path = row[0]
+    fields = [
+        r[0]
+        for r in conn.execute(
+            "SELECT field_name FROM source_fields WHERE source_name = ?"
+            " ORDER BY rowid",
+            (source,),
+        )
+    ]
+    mappings = dict(
+        conn.execute(
+            "SELECT source_column, target_column FROM field_mappings"
+            " WHERE source_name = ?",
+            (source,),
+        ).fetchall()
+    )
+    return csv_path, fields, mappings
+
+
+def known_signatures(conn: sqlite3.Connection, source: str) -> set[str]:
+    """返回该来源此前任意批次已成功导入的全部记录签名。"""
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT signature FROM imported_records WHERE source_name = ?",
+            (source,),
+        )
+    }
+
+
+def save_batch(
+    conn: sqlite3.Connection,
+    source: str,
+    batch_no: int,
+    imported: Sequence[tuple[int, str]],
+    stats: dict[str, int],
+) -> None:
+    """原子写入一个批次：成功记录签名与批次统计，同时提交或同时回滚。
+
+    imported 为 (行号, 签名) 序列，仅包含本批次实际导入的行。
+    """
+    with conn:
+        conn.executemany(
+            "INSERT INTO imported_records (source_name, batch_no, signature)"
+            " VALUES (?, ?, ?)",
+            [(source, batch_no, signature) for _, signature in imported],
+        )
+        conn.execute(
+            "INSERT INTO import_batches (source_name, batch_no, total_rows,"
+            " success_count, duplicate_count, failed_count, new_count)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                source,
+                batch_no,
+                stats["total"],
+                stats["success"],
+                stats["duplicate"],
+                stats["failed"],
+                stats["new"],
+            ),
+        )
+
+
+def next_batch_no(conn: sqlite3.Connection, source: str) -> int:
+    """返回该来源下一个批次号（已有最大批次号 + 1，首次为 1）。"""
+    row = conn.execute(
+        "SELECT MAX(batch_no) FROM import_batches WHERE source_name = ?",
+        (source,),
+    ).fetchone()
+    return (row[0] or 0) + 1
