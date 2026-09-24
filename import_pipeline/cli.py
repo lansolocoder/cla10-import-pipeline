@@ -5,6 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
+from . import importer
 from . import ledger
 
 
@@ -37,6 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_mappings.add_argument("source", help="已注册的来源名")
 
+    run_import = subparsers.add_parser(
+        "run-import", help="执行一次导入: 来源名"
+    )
+    run_import.add_argument("source", help="已注册的来源名")
+
+    show_batch = subparsers.add_parser(
+        "show-batch", help="查询某来源的批次记录: 来源名 批次号"
+    )
+    show_batch.add_argument("source", help="已注册的来源名")
+    show_batch.add_argument("batch_num", type=int, help="批次号（从 1 开始）")
+
     return parser
 
 
@@ -63,6 +75,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "list-mappings":
             for source_column, target_column in ledger.list_mappings(conn, args.source):
                 print(f"{source_column}\t{target_column}")
+        elif args.command == "run-import":
+            count = importer.run_import(conn, args.source)
+            print(f"Result: run-import {args.source} {count}")
+        elif args.command == "show-batch":
+            # 批次号必须存在；随后按批次号升序输出该来源各批次。
+            ledger.get_batch(conn, args.source, args.batch_num)
+            for batch_num, status, success_count, quarantined_count in (
+                ledger.list_batches(conn, args.source)
+            ):
+                print(
+                    f"{batch_num}\t{status}\t{success_count}\t{quarantined_count}"
+                )
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -31,6 +31,21 @@ CREATE TABLE IF NOT EXISTS field_mappings (
     target_column TEXT NOT NULL,
     PRIMARY KEY (source_name, source_column)
 );
+CREATE TABLE IF NOT EXISTS import_batches (
+    batch_num INTEGER NOT NULL,
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    status TEXT NOT NULL,
+    success_count INTEGER NOT NULL,
+    quarantined_count INTEGER NOT NULL,
+    PRIMARY KEY (source_name, batch_num)
+);
+CREATE TABLE IF NOT EXISTS imported_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT NOT NULL,
+    batch_num INTEGER NOT NULL,
+    target_column TEXT NOT NULL,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -141,3 +156,88 @@ def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]
         " WHERE source_name = ? ORDER BY rowid",
         (source,),
     ).fetchall()
+
+
+def get_source(conn: sqlite3.Connection, name: str) -> tuple[str, list[str]]:
+    """返回 (CSV 路径, 必需字段名列表)；来源不存在时拒绝。"""
+    row = conn.execute(
+        "SELECT csv_path FROM sources WHERE name = ?", (name,)
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"来源不存在: {name}")
+    fields = [
+        r[0]
+        for r in conn.execute(
+            "SELECT field_name FROM source_fields WHERE source_name = ?"
+            " ORDER BY rowid",
+            (name,),
+        )
+    ]
+    return row[0], fields
+
+
+def record_batch(
+    conn: sqlite3.Connection,
+    source: str,
+    status: str,
+    success_count: int,
+    quarantined_count: int,
+    records: Sequence[dict[str, str]] = (),
+) -> int:
+    """登记一个导入批次并（仅成功时）写入数据行，原子提交，返回批次号。
+
+    批次号在同一来源下从 1 开始按创建顺序递增。被拒绝批次只登记台账，
+    不写入任何数据行。
+    """
+    with conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(batch_num), 0) FROM import_batches"
+            " WHERE source_name = ?",
+            (source,),
+        ).fetchone()
+        batch_num = row[0] + 1
+        conn.execute(
+            "INSERT INTO import_batches (batch_num, source_name, status,"
+            " success_count, quarantined_count) VALUES (?, ?, ?, ?, ?)",
+            (batch_num, source, status, success_count, quarantined_count),
+        )
+        if status == "ok" and records:
+            conn.executemany(
+                "INSERT INTO imported_records (source_name, batch_num,"
+                " target_column, value) VALUES (?, ?, ?, ?)",
+                [
+                    (source, batch_num, target_column, value)
+                    for record in records
+                    for target_column, value in record.items()
+                ],
+            )
+    return batch_num
+
+
+def list_batches(
+    conn: sqlite3.Connection, source: str
+) -> list[tuple[int, str, int, int]]:
+    """按批次号升序返回某来源的 (批次号, 状态, 成功行数, 被隔离行数)。"""
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    return conn.execute(
+        "SELECT batch_num, status, success_count, quarantined_count"
+        " FROM import_batches WHERE source_name = ? ORDER BY batch_num",
+        (source,),
+    ).fetchall()
+
+
+def get_batch(
+    conn: sqlite3.Connection, source: str, batch_num: int
+) -> tuple[int, str, int, int]:
+    """返回单个批次 (批次号, 状态, 成功行数, 被隔离行数)；不存在时拒绝。"""
+    row = conn.execute(
+        "SELECT batch_num, status, success_count, quarantined_count"
+        " FROM import_batches WHERE source_name = ? AND batch_num = ?",
+        (source, batch_num),
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"批次不存在: {source} {batch_num}")
+    return row
