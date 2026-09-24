@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     show_batch.add_argument("source", help="已注册的来源名")
     show_batch.add_argument("batch_no", type=int, help="起始批次号（含）")
 
+    revoke_batch = subparsers.add_parser(
+        "revoke-batch", help="撤销批次: 来源名 批次号"
+    )
+    revoke_batch.add_argument("source", help="已注册的来源名")
+    revoke_batch.add_argument("batch_no", type=int, help="待撤销的批次号（正整数）")
+
     return parser
 
 
@@ -77,6 +83,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "run-import":
             count = ledger.run_import(conn, args.source)
             print(f"Result: run-import {args.source} {count}")
+        elif args.command == "revoke-batch":
+            ledger.revoke_batch(conn, args.source, args.batch_no)
+            print(f"Result: revoke-batch {args.source} {args.batch_no}")
         elif args.command == "show-batch":
             for batch_no, status, succeeded, quarantined in ledger.show_batches(
                 conn, args.source, args.batch_no
