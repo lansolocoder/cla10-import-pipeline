@@ -37,6 +37,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_mappings.add_argument("source", help="已注册的来源名")
 
+    run_import = subparsers.add_parser(
+        "run-import", help="执行一次导入: 来源名"
+    )
+    run_import.add_argument("source", help="已注册的来源名")
+
+    show_batch = subparsers.add_parser(
+        "show-batch", help="查询批次记录: 来源名 批次号"
+    )
+    show_batch.add_argument("source", help="已注册的来源名")
+    show_batch.add_argument("batch_no", type=int, help="起始批次号（含）")
+
     return parser
 
 
@@ -63,6 +74,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "list-mappings":
             for source_column, target_column in ledger.list_mappings(conn, args.source):
                 print(f"{source_column}\t{target_column}")
+        elif args.command == "run-import":
+            count = ledger.run_import(conn, args.source)
+            print(f"Result: run-import {args.source} {count}")
+        elif args.command == "show-batch":
+            for batch_no, status, succeeded, quarantined in ledger.show_batches(
+                conn, args.source, args.batch_no
+            ):
+                print(f"{batch_no}\t{status}\t{succeeded}\t{quarantined}")
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import os
 import sqlite3
 from collections.abc import Sequence
@@ -30,6 +32,23 @@ CREATE TABLE IF NOT EXISTS field_mappings (
     source_column TEXT NOT NULL,
     target_column TEXT NOT NULL,
     PRIMARY KEY (source_name, source_column)
+);
+CREATE TABLE IF NOT EXISTS batches (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    batch_no INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    succeeded_rows INTEGER NOT NULL,
+    quarantined_rows INTEGER NOT NULL,
+    PRIMARY KEY (source_name, batch_no)
+);
+CREATE TABLE IF NOT EXISTS imported_rows (
+    source_name TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    row_number INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (source_name, batch_no, row_number),
+    FOREIGN KEY (source_name, batch_no)
+        REFERENCES batches (source_name, batch_no)
 );
 """
 
@@ -140,4 +159,135 @@ def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]
         "SELECT source_column, target_column FROM field_mappings"
         " WHERE source_name = ? ORDER BY rowid",
         (source,),
+    ).fetchall()
+
+
+def _record_batch(
+    conn: sqlite3.Connection,
+    source: str,
+    status: str,
+    succeeded_rows: int,
+    quarantined_rows: int,
+) -> int:
+    """登记批次记录，返回分配的批次号（来源内从 1 递增）。调用方负责事务。"""
+    batch_no = conn.execute(
+        "SELECT COALESCE(MAX(batch_no), 0) + 1 FROM batches WHERE source_name = ?",
+        (source,),
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO batches"
+        " (source_name, batch_no, status, succeeded_rows, quarantined_rows)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (source, batch_no, status, succeeded_rows, quarantined_rows),
+    )
+    return batch_no
+
+
+def run_import(conn: sqlite3.Connection, source: str) -> int:
+    """执行一次导入，返回成功行数。
+
+    文件不存在时不留批次记录；校验失败登记 rejected 批次后抛 LedgerError；
+    成功时数据行与 ok 批次在同一事务内落库。
+    """
+    row = conn.execute(
+        "SELECT csv_path FROM sources WHERE name = ?", (source,)
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"来源不存在: {source}")
+    csv_path = row[0]
+    if not Path(csv_path).is_file():
+        raise LedgerError(f"CSV 文件不存在: {csv_path}")
+
+    mappings = list_mappings(conn, source)
+    target_by_source = dict(mappings)
+    required_fields = [
+        r[0]
+        for r in conn.execute(
+            "SELECT field_name FROM source_fields WHERE source_name = ?"
+            " ORDER BY rowid",
+            (source,),
+        )
+    ]
+
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
+    except OSError as exc:
+        raise LedgerError(f"CSV 文件读取失败: {csv_path}: {exc}") from exc
+
+    header: list[str] | None = rows[0] if rows else None
+    data_rows = rows[1:] if rows else []
+
+    error: str | None = None
+    if header is None:
+        error = "CSV 文件缺少表头"
+    else:
+        for column in header:
+            if column not in target_by_source:
+                error = f"未映射的源列: {column}"
+                break
+        if error is None:
+            produced = {target_by_source[column] for column in header}
+            for field in required_fields:
+                if field not in produced:
+                    error = f"缺少映射目标对应列: {field}"
+                    break
+        if error is None:
+            for data_row in data_rows:
+                if len(data_row) != len(header) or any(
+                    not value.strip() for value in data_row
+                ):
+                    error = "数据行含空白值"
+                    break
+
+    if error is not None:
+        with conn:  # 拒绝也留批次记录；已校验行不落库
+            _record_batch(conn, source, "rejected", 0, len(data_rows))
+        raise LedgerError(error)
+
+    with conn:  # 数据行与批次记录原子提交
+        batch_no = _record_batch(conn, source, "ok", len(data_rows), 0)
+        conn.executemany(
+            "INSERT INTO imported_rows"
+            " (source_name, batch_no, row_number, data) VALUES (?, ?, ?, ?)",
+            [
+                (
+                    source,
+                    batch_no,
+                    index,
+                    json.dumps(
+                        {
+                            target_by_source[column]: value
+                            for column, value in zip(header, data_row)
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                for index, data_row in enumerate(data_rows, start=1)
+            ],
+        )
+    return len(data_rows)
+
+
+def show_batches(
+    conn: sqlite3.Connection, source: str, batch_no: int
+) -> list[tuple[int, str, int, int]]:
+    """返回某来源自 batch_no 起（含）的批次，按批次号升序。
+
+    来源或批次号不存在时拒绝。
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    if not conn.execute(
+        "SELECT 1 FROM batches WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone():
+        raise LedgerError(f"批次不存在: {batch_no}")
+    return conn.execute(
+        "SELECT batch_no, status, succeeded_rows, quarantined_rows"
+        " FROM batches WHERE source_name = ? AND batch_no >= ?"
+        " ORDER BY batch_no",
+        (source, batch_no),
     ).fetchall()

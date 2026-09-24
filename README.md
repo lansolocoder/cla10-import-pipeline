@@ -32,4 +32,15 @@ python3 -m import_pipeline list-mappings orders
 
 校验规则：来源名、路径、字段名、列名均须为非空字符串；布尔与状态字面值只接受小写 `true`/`false`/`ok`/`failed`/`rejected`，大小写不同（如 `TRUE`）视为非法输入并拒绝。重复注册来源名、重复字段名、同一来源下重复源列名、引用不存在的来源均被拒绝，且数据库保持执行前状态（单次操作原子提交）。
 
-尚未实现增量导入、校验失败隔离以及重跑与结果台账。
+## 导入批次
+
+```bash
+# 执行一次导入：读取来源登记的 CSV 路径，按字段映射落库
+python3 -m import_pipeline run-import orders
+
+# 只读查询：输出来源自给定批次号起（含）的各批次，
+# 每行：批次号、状态、成功行数、被隔离行数（制表符分隔，按批次号升序）
+python3 -m import_pipeline show-batch orders 1
+```
+
+`run-import` 的 CSV 首行为表头，数据行按已登记的字段映射写入 `imported_rows`。出现未映射的源列、必需字段缺少映射目标对应列，或数据行的值为空白时整批拒绝：退出码 1、stderr 一行 `Error:`，批次状态记为 `rejected`，已校验行不落库；否则整批落库，退出码 0，stdout 输出 `Result: run-import <来源名> <成功行数>`，批次状态记为 `ok`。CSV 文件不存在时退出码 1 且不留批次记录。无论成功或拒绝都会在 `batches` 表留下批次记录：批次号（来源内从 1 递增）、来源名、状态、成功行数、被隔离行数。重复执行视为新批次，已有批次记录不变。`show-batch` 的来源名或批次号不存在时退出码 1、stderr 一行 `Error:`。
