@@ -171,6 +171,120 @@ class ImportCommandTests(unittest.TestCase):
         self.assertTrue(result.stderr.startswith("Error:"))
         self.assertEqual(result.stdout, "")
 
+    def test_revoke_ok_batch_deletes_rows_and_flips_status(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n2,20\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+        self.write_csv("order_id,total\n3,30\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+        self.assertEqual(self.imported_row_count(), 3)
+
+        result = self.invoke("revoke-batch", "orders", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Result: revoke-batch orders 1")
+        self.assertEqual(result.stderr, "")
+
+        self.assertEqual(
+            self.batches(),
+            [(1, "revoked", 2, 0), (2, "ok", 1, 0)],
+        )
+        # 仅撤销批次的行被删除；其他批次行保持原状
+        conn = sqlite3.connect(self.db_path)
+        try:
+            remaining = conn.execute(
+                "SELECT batch_no, row_number FROM imported_rows"
+                " ORDER BY batch_no, row_number"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(remaining, [(2, 1)])
+
+        show = self.invoke("show-batch", "orders", "1")
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertEqual(
+            show.stdout.splitlines(),
+            ["1\trevoked\t2\t0", "2\tok\t1\t0"],
+        )
+
+    def test_revoking_twice_is_rejected_without_change(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n2,20\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+
+        result = self.invoke("revoke-batch", "orders", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("Error:"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.batches(), [(1, "revoked", 2, 0)])
+        self.assertEqual(self.imported_row_count(), 0)
+
+    def test_revoke_rejected_batch_is_refused(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n2,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.write_csv("order_id,total\n3,30\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+
+        result = self.invoke("revoke-batch", "orders", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("Error:"))
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            self.batches(),
+            [(1, "rejected", 0, 2), (2, "ok", 1, 0)],
+        )
+        self.assertEqual(self.imported_row_count(), 1)
+
+    def test_revoke_unknown_source_or_batch_is_rejected(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+
+        result = self.invoke("revoke-batch", "missing", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("Error:"))
+        self.assertEqual(result.stdout, "")
+
+        result = self.invoke("revoke-batch", "orders", "9")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr.startswith("Error:"))
+        self.assertEqual(result.stdout, "")
+
+        self.assertEqual(self.batches(), [(1, "ok", 1, 0)])
+        self.assertEqual(self.imported_row_count(), 1)
+
+    def test_revoke_rejects_invalid_source_name(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+
+        for source in ["TRUE", "  "]:
+            with self.subTest(source=source):
+                result = self.invoke("revoke-batch", source, "1")
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("Error:"))
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.batches(), [(1, "ok", 1, 0)])
+        self.assertEqual(self.imported_row_count(), 1)
+
+    def test_revoke_rejects_non_positive_batch_number(self) -> None:
+        self.register_orders()
+        self.write_csv("order_id,total\n1,10\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 0)
+
+        for batch_no in ["0", "-1"]:
+            with self.subTest(batch_no=batch_no):
+                result = self.invoke("revoke-batch", "orders", batch_no)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("Error:"))
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.batches(), [(1, "ok", 1, 0)])
+        self.assertEqual(self.imported_row_count(), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

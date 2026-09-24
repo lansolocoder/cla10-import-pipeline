@@ -269,6 +269,43 @@ def run_import(conn: sqlite3.Connection, source: str) -> int:
     return len(data_rows)
 
 
+def revoke_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> None:
+    """撤销某来源指定批次号的单个 ok 批次。
+
+    批次状态置为 revoked，该批次的 imported_rows 全部删除；批次计数保持不变。
+    仅允许撤销 ok 批次；来源/批次不存在或状态非 ok 时拒绝且不留任何变更。
+    """
+    _validate_token(source, "来源名")
+    if not isinstance(batch_no, int) or isinstance(batch_no, bool) or batch_no <= 0:
+        raise LedgerError(f"批次号必须为正整数: {batch_no}")
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    row = conn.execute(
+        "SELECT status FROM batches WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"批次不存在: {batch_no}")
+    if row[0] != "ok":
+        raise LedgerError(f"批次状态不允许撤销: {row[0]}")
+    try:
+        with conn:  # 删除行与状态翻转原子提交，异常即整体回滚
+            conn.execute(
+                "DELETE FROM imported_rows"
+                " WHERE source_name = ? AND batch_no = ?",
+                (source, batch_no),
+            )
+            conn.execute(
+                "UPDATE batches SET status = 'revoked'"
+                " WHERE source_name = ? AND batch_no = ?",
+                (source, batch_no),
+            )
+    except sqlite3.Error as exc:
+        raise LedgerError(f"批次撤销失败: {exc}") from exc
+
+
 def show_batches(
     conn: sqlite3.Connection, source: str, batch_no: int
 ) -> list[tuple[int, str, int, int]]:
