@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS field_mappings (
     target_column TEXT NOT NULL,
     PRIMARY KEY (source_name, source_column)
 );
+CREATE TABLE IF NOT EXISTS import_batches (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    batch_no INTEGER NOT NULL,
+    total_rows INTEGER NOT NULL,
+    imported_rows INTEGER NOT NULL,
+    duplicate_rows INTEGER NOT NULL,
+    rejected_rows INTEGER NOT NULL,
+    incremental_rows INTEGER NOT NULL,
+    PRIMARY KEY (source_name, batch_no)
+);
+CREATE TABLE IF NOT EXISTS imported_records (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    signature TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    PRIMARY KEY (source_name, signature)
+);
 """
 
 

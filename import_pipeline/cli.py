@@ -5,6 +5,7 @@ import sys
 from collections.abc import Sequence
 
 from . import __version__
+from . import importer
 from . import ledger
 
 
@@ -37,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_mappings.add_argument("source", help="已注册的来源名")
 
+    import_cmd = subparsers.add_parser(
+        "import", help="执行批次导入: 来源名"
+    )
+    import_cmd.add_argument("source", help="已注册的来源名")
+
     return parser
 
 
@@ -63,6 +69,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "list-mappings":
             for source_column, target_column in ledger.list_mappings(conn, args.source):
                 print(f"{source_column}\t{target_column}")
+        elif args.command == "import":
+            result = importer.import_source(conn, args.source)
+            print(
+                f"Result: import {result.source} {result.batch_no}"
+                f" {result.total_rows} {result.imported_rows}"
+                f" {result.duplicate_rows} {result.rejected_rows}"
+                f" {result.incremental_rows}"
+            )
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
