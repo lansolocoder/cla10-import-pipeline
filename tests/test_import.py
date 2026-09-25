@@ -180,5 +180,208 @@ class ImportCommandTests(unittest.TestCase):
         )
 
 
+class BatchOperationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.db_path = self.work / "import_ledger.db"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(
+            os.environ,
+            IMPORT_LEDGER_DB=str(self.db_path),
+            PYTHONPATH=str(ROOT),
+        )
+        return subprocess.run(
+            [sys.executable, "-m", "import_pipeline", *arguments],
+            cwd=self.work,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def write_csv(self, name: str, content: str) -> str:
+        path = self.work / name
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    def register_orders(self, csv_path: str) -> None:
+        self.assertEqual(
+            self.invoke("add-source", "orders", csv_path, "id", "amount").returncode,
+            0,
+        )
+        self.assertEqual(
+            self.invoke("add-mapping", "orders", "order_id", "id").returncode, 0
+        )
+        self.assertEqual(
+            self.invoke("add-mapping", "orders", "total", "amount").returncode, 0
+        )
+
+    def record_rows(self) -> list[tuple]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT signature, batch_no FROM imported_records"
+                " WHERE source_name = 'orders' ORDER BY rowid"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def test_batches_lists_rows_ascending_tab_separated(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\nA2,20\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        Path(csv_path).write_text(
+            "order_id,total\nA1,10\nA2,20\n", encoding="utf-8"
+        )
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+
+        result = self.invoke("batches", "orders")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "1\t2\t2\t0\t0\t2",
+                "2\t2\t0\t2\t0\t0",
+                "Result: batches orders",
+            ],
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_batches_unknown_source_is_error(self) -> None:
+        result = self.invoke("batches", "missing")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_batches_empty_outputs_only_result_line(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\n")
+        self.register_orders(csv_path)
+        result = self.invoke("batches", "orders")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Result: batches orders")
+
+    def test_reimport_replaces_batch_atomically_with_same_number(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\nA2,20\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        # 重跑前 A1/A2 签名均归属批次 1（批次 2 全部判重，无签名）。
+        self.assertEqual(len(self.record_rows()), 2)
+
+        # 扩展 CSV：重跑批次 1 时 A1/A2 与其自身签名判重，A3 为增量。
+        Path(csv_path).write_text(
+            "order_id,total\nA1,10\nA2,20\nA3,30\n", encoding="utf-8"
+        )
+        result = self.invoke("reimport", "orders", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Result: reimport orders 1 3 1 2 0 1")
+        self.assertEqual(result.stderr, "")
+
+        listing = self.invoke("batches", "orders").stdout.splitlines()
+        self.assertEqual(
+            listing,
+            [
+                "1\t3\t1\t2\t0\t1",
+                "2\t2\t0\t2\t0\t0",
+                "Result: batches orders",
+            ],
+        )
+        # 批次 1 的签名被整体替换：A1/A2（判重）删除，仅 A3 归属批次 1。
+        sigs = self.record_rows()
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0][1], 1)
+
+    def test_reimport_missing_batch_is_error_without_changes(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        result = self.invoke("reimport", "orders", "9")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("9", result.stderr)
+        self.assertNotIn("Result:", result.stdout)
+        self.assertEqual(
+            self.invoke("batches", "orders").stdout.splitlines(),
+            ["1\t1\t1\t0\t0\t1", "Result: batches orders"],
+        )
+
+    def test_reimport_precheck_failure_changes_nothing(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        before_sigs = self.record_rows()
+        Path(csv_path).unlink()
+        result = self.invoke("reimport", "orders", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.record_rows(), before_sigs)
+        self.assertEqual(
+            self.invoke("batches", "orders").stdout.splitlines(),
+            ["1\t1\t1\t0\t0\t1", "Result: batches orders"],
+        )
+
+    def test_reimport_unknown_source_is_error(self) -> None:
+        result = self.invoke("reimport", "missing", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing", result.stderr)
+
+    def test_rollback_deletes_only_that_batch_signatures(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\nA2,20\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        Path(csv_path).write_text(
+            "order_id,total\nA3,30\n", encoding="utf-8"
+        )
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+
+        result = self.invoke("rollback", "orders", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Result: rollback orders 1 2")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.work / "rejected_orders_1.csv").exists())
+
+        self.assertEqual(
+            self.invoke("batches", "orders").stdout.splitlines(),
+            ["2\t1\t1\t0\t0\t1", "Result: batches orders"],
+        )
+        # 仅批次 2 的签名保留；批次 1 的 A1/A2 可再次导入。
+        remaining = {row[1] for row in self.record_rows()}
+        self.assertEqual(remaining, {2})
+        Path(csv_path).write_text(
+            "order_id,total\nA1,10\nA3,30\n", encoding="utf-8"
+        )
+        result = self.invoke("import", "orders")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Result: import orders 3 2 1 1 0 1")
+
+    def test_rollback_missing_batch_is_error_without_changes(self) -> None:
+        csv_path = self.write_csv("orders.csv", "order_id,total\nA1,10\n")
+        self.register_orders(csv_path)
+        self.assertEqual(self.invoke("import", "orders").returncode, 0)
+        result = self.invoke("rollback", "orders", "9")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("9", result.stderr)
+        self.assertNotIn("Result:", result.stdout)
+        self.assertEqual(
+            self.invoke("batches", "orders").stdout.splitlines(),
+            ["1\t1\t1\t0\t0\t1", "Result: batches orders"],
+        )
+
+    def test_rollback_unknown_source_is_error(self) -> None:
+        result = self.invoke("rollback", "missing", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing", result.stderr)
+
+    def test_invalid_batch_numbers_are_usage_errors(self) -> None:
+        for bad in ("0", "-1", "01", "007", "1.0", "abc", "1a"):
+            for command in ("reimport", "rollback"):
+                with self.subTest(command=command, bad=bad):
+                    result = self.invoke(command, "orders", bad)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotEqual(result.stderr, "")
+                    self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()

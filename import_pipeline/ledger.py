@@ -157,3 +157,54 @@ def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]
         " WHERE source_name = ? ORDER BY rowid",
         (source,),
     ).fetchall()
+
+
+def list_batches(
+    conn: sqlite3.Connection, source: str
+) -> list[tuple[int, int, int, int, int, int]]:
+    """按批次号升序返回某来源每批的计数。
+
+    每项为 (批次号, 总行数, 成功导入数, 重复丢弃数, 校验失败数, 增量新数据数)。
+    来源未注册时抛 LedgerError；无批次时返回空列表。
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    return conn.execute(
+        "SELECT batch_no, total_rows, imported_rows, duplicate_rows,"
+        " rejected_rows, incremental_rows FROM import_batches"
+        " WHERE source_name = ? ORDER BY batch_no",
+        (source,),
+    ).fetchall()
+
+
+def rollback_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> int:
+    """撤销指定批次，返回该批次记录的总行数。
+
+    删除批次记录及其当时新增的导入记录签名（仅该批签名，更早批次保留）。
+    不产生拒绝文件。来源或批次不存在时抛 LedgerError 且无任何变更。
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    row = conn.execute(
+        "SELECT total_rows FROM import_batches"
+        " WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"批次不存在: {source} #{batch_no}")
+    total_rows = row[0]
+    with conn:  # 批次记录与该批签名单次原子提交，异常即回滚
+        conn.execute(
+            "DELETE FROM imported_records"
+            " WHERE source_name = ? AND batch_no = ?",
+            (source, batch_no),
+        )
+        conn.execute(
+            "DELETE FROM import_batches WHERE source_name = ? AND batch_no = ?",
+            (source, batch_no),
+        )
+    return total_rows

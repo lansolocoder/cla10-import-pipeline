@@ -1,12 +1,22 @@
 """Command-line entry point."""
 
 import argparse
+import re
 import sys
 from collections.abc import Sequence
 
 from . import __version__
 from . import importer
 from . import ledger
+
+_POSITIVE_INT = re.compile(r"[1-9][0-9]*")
+
+
+def positive_int(value: str) -> int:
+    """十进制正整数（不接受前导零、符号或其他写法），非法时按用法错误处理。"""
+    if not _POSITIVE_INT.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"批次号必须是十进制正整数: {value}")
+    return int(value)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +53,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_cmd.add_argument("source", help="已注册的来源名")
 
+    batches = subparsers.add_parser(
+        "batches", help="查看某来源的全部批次计数（只读）"
+    )
+    batches.add_argument("source", help="已注册的来源名")
+
+    reimport_cmd = subparsers.add_parser(
+        "reimport", help="重跑指定批次并原子替换原批次记录"
+    )
+    reimport_cmd.add_argument("source", help="已注册的来源名")
+    reimport_cmd.add_argument("batch_no", type=positive_int, help="批次号（十进制正整数）")
+
+    rollback_cmd = subparsers.add_parser(
+        "rollback", help="撤销指定批次：删除批次记录及其新增签名"
+    )
+    rollback_cmd.add_argument("source", help="已注册的来源名")
+    rollback_cmd.add_argument("batch_no", type=positive_int, help="批次号（十进制正整数）")
+
     return parser
 
 
@@ -76,6 +103,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f" {result.total_rows} {result.imported_rows}"
                 f" {result.duplicate_rows} {result.rejected_rows}"
                 f" {result.incremental_rows}"
+            )
+        elif args.command == "batches":
+            for (
+                batch_no,
+                total_rows,
+                imported_rows,
+                duplicate_rows,
+                rejected_rows,
+                incremental_rows,
+            ) in ledger.list_batches(conn, args.source):
+                print(
+                    f"{batch_no}\t{total_rows}\t{imported_rows}"
+                    f"\t{duplicate_rows}\t{rejected_rows}\t{incremental_rows}"
+                )
+            print(f"Result: batches {args.source}")
+        elif args.command == "reimport":
+            result = importer.reimport_source(conn, args.source, args.batch_no)
+            print(
+                f"Result: reimport {result.source} {result.batch_no}"
+                f" {result.total_rows} {result.imported_rows}"
+                f" {result.duplicate_rows} {result.rejected_rows}"
+                f" {result.incremental_rows}"
+            )
+        elif args.command == "rollback":
+            total_rows = ledger.rollback_batch(conn, args.source, args.batch_no)
+            print(
+                f"Result: rollback {args.source} {args.batch_no} {total_rows}"
             )
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)

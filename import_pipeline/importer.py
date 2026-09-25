@@ -34,10 +34,10 @@ def _row_signature(record: dict[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def import_source(
-    conn: sqlite3.Connection, source: str, reject_dir: Path | None = None
-) -> ImportResult:
-    """执行一个批次的导入，返回结果计数；预检失败抛 LedgerError。"""
+def _prepare(
+    conn: sqlite3.Connection, source: str
+) -> tuple[list[list[str]], list[str], dict[str, str], list[str]]:
+    """预检并返回 (数据行, 表头, 源列->目标列映射, 必需字段列表)。"""
     row = conn.execute(
         "SELECT csv_path FROM sources WHERE name = ?", (source,)
     ).fetchone()
@@ -77,14 +77,17 @@ def import_source(
         if field not in mapped_targets:
             raise LedgerError(f"必需字段未全部映射: {field}")
 
-    seen = {
-        r[0]
-        for r in conn.execute(
-            "SELECT signature FROM imported_records WHERE source_name = ?",
-            (source,),
-        )
-    }
+    return data_rows, header, mapping, required
 
+
+def _classify_rows(
+    data_rows: list[list[str]],
+    header: list[str],
+    mapping: dict[str, str],
+    required: list[str],
+    seen: set[str],
+) -> tuple[int, int, list[list[str]], list[str]]:
+    """按既有行语义分类，返回 (成功数, 重复数, 失败行, 增量新签名)。"""
     imported = 0
     duplicates = 0
     rejected: list[list[str]] = []
@@ -104,6 +107,34 @@ def import_source(
         seen.add(signature)
         new_signatures.append(signature)
         imported += 1
+    return imported, duplicates, rejected, new_signatures
+
+
+def _write_rejected(
+    rejected: list[list[str]], header: list[str], path: Path
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rejected)
+
+
+def import_source(
+    conn: sqlite3.Connection, source: str, reject_dir: Path | None = None
+) -> ImportResult:
+    """执行一个批次的导入，返回结果计数；预检失败抛 LedgerError。"""
+    data_rows, header, mapping, required = _prepare(conn, source)
+
+    seen = {
+        r[0]
+        for r in conn.execute(
+            "SELECT signature FROM imported_records WHERE source_name = ?",
+            (source,),
+        )
+    }
+    imported, duplicates, rejected, new_signatures = _classify_rows(
+        data_rows, header, mapping, required, seen
+    )
 
     previous = conn.execute(
         "SELECT MAX(batch_no) FROM import_batches WHERE source_name = ?",
@@ -134,10 +165,82 @@ def import_source(
 
     if rejected:
         reject_path = (reject_dir or Path.cwd()) / f"rejected_{source}_{batch_no}.csv"
-        with reject_path.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(header)
-            writer.writerows(rejected)
+        _write_rejected(rejected, header, reject_path)
+
+    return ImportResult(
+        source=source,
+        batch_no=batch_no,
+        total_rows=len(data_rows),
+        imported_rows=imported,
+        duplicate_rows=duplicates,
+        rejected_rows=len(rejected),
+        incremental_rows=imported,
+    )
+
+
+def reimport_source(
+    conn: sqlite3.Connection,
+    source: str,
+    batch_no: int,
+    reject_dir: Path | None = None,
+) -> ImportResult:
+    """显式重跑指定批次：沿用全部导进行语义，原子替换原批次记录，批次号不变。
+
+    签名判重与同来源当前全部已导入成功记录比较（含被重跑批次自身）。
+    来源或目标批次不存在、预检失败时抛 LedgerError，且不改动任何记录与文件。
+    """
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone() is None:
+        raise LedgerError(f"来源不存在: {source}")
+    if conn.execute(
+        "SELECT 1 FROM import_batches WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone() is None:
+        raise LedgerError(f"批次不存在: {source} #{batch_no}")
+
+    data_rows, header, mapping, required = _prepare(conn, source)
+
+    seen = {
+        r[0]
+        for r in conn.execute(
+            "SELECT signature FROM imported_records WHERE source_name = ?",
+            (source,),
+        )
+    }
+    imported, duplicates, rejected, new_signatures = _classify_rows(
+        data_rows, header, mapping, required, seen
+    )
+
+    with conn:  # 删除旧签名、替换批次计数、写入新签名单次原子提交
+        conn.execute(
+            "DELETE FROM imported_records"
+            " WHERE source_name = ? AND batch_no = ?",
+            (source, batch_no),
+        )
+        conn.execute(
+            "UPDATE import_batches SET total_rows = ?, imported_rows = ?,"
+            " duplicate_rows = ?, rejected_rows = ?, incremental_rows = ?"
+            " WHERE source_name = ? AND batch_no = ?",
+            (
+                len(data_rows),
+                imported,
+                duplicates,
+                len(rejected),
+                imported,
+                source,
+                batch_no,
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO imported_records (source_name, signature, batch_no)"
+            " VALUES (?, ?, ?)",
+            [(source, signature, batch_no) for signature in new_signatures],
+        )
+
+    if rejected:
+        reject_path = (reject_dir or Path.cwd()) / f"rejected_{source}_{batch_no}.csv"
+        _write_rejected(rejected, header, reject_path)
 
     return ImportResult(
         source=source,
