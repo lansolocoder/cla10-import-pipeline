@@ -146,6 +146,22 @@ def list_sources(conn: sqlite3.Connection) -> list[tuple[str, str, list[str]]]:
     return result
 
 
+def list_batches(
+    conn: sqlite3.Connection, source: str
+) -> list[tuple[int, int, int, int, int, int]]:
+    """按批次号升序返回某来源的批次计数；来源不存在时拒绝。"""
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    return conn.execute(
+        "SELECT batch_no, total_rows, imported_rows, duplicate_rows,"
+        " rejected_rows, incremental_rows FROM import_batches"
+        " WHERE source_name = ? ORDER BY batch_no",
+        (source,),
+    ).fetchall()
+
+
 def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]]:
     """按注册顺序返回某来源的 (源列名, 目标列名)；来源不存在时拒绝。"""
     if not conn.execute(
