@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS import_batches (
     duplicate_rows INTEGER NOT NULL,
     rejected_rows INTEGER NOT NULL,
     incremental_rows INTEGER NOT NULL,
+    created_by TEXT NOT NULL DEFAULT 'import',
     PRIMARY KEY (source_name, batch_no)
 );
 CREATE TABLE IF NOT EXISTS imported_records (
@@ -47,7 +48,22 @@ CREATE TABLE IF NOT EXISTS imported_records (
     batch_no INTEGER NOT NULL,
     PRIMARY KEY (source_name, signature)
 );
+CREATE TABLE IF NOT EXISTS fix_reviews (
+    source_name TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    PRIMARY KEY (source_name, batch_no)
+);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧库补列：import_batches.created_by（既有批次均视为 import 创建）。"""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(import_batches)")}
+    if "created_by" not in columns:
+        conn.execute(
+            "ALTER TABLE import_batches"
+            " ADD COLUMN created_by TEXT NOT NULL DEFAULT 'import'"
+        )
 
 
 class LedgerError(Exception):
@@ -65,6 +81,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path())
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
 
 
@@ -201,6 +218,10 @@ def rollback_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> int:
         conn.execute(
             "DELETE FROM imported_records"
             " WHERE source_name = ? AND batch_no = ?",
+            (source, batch_no),
+        )
+        conn.execute(
+            "DELETE FROM fix_reviews WHERE source_name = ? AND batch_no = ?",
             (source, batch_no),
         )
         conn.execute(
