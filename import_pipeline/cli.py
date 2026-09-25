@@ -70,6 +70,18 @@ def build_parser() -> argparse.ArgumentParser:
     rollback_cmd.add_argument("source", help="已注册的来源名")
     rollback_cmd.add_argument("batch_no", type=positive_int, help="批次号（十进制正整数）")
 
+    fix_rejects_cmd = subparsers.add_parser(
+        "fix-rejects", help="导出指定批次的可疑行供人工复核: 来源名 批次号"
+    )
+    fix_rejects_cmd.add_argument("source", help="已注册的来源名")
+    fix_rejects_cmd.add_argument("batch_no", type=positive_int, help="批次号（十进制正整数）")
+
+    apply_fixed_cmd = subparsers.add_parser(
+        "apply-fixed", help="应用人工复核结果并单事务更新批次计数: 来源名 批次号"
+    )
+    apply_fixed_cmd.add_argument("source", help="已注册的来源名")
+    apply_fixed_cmd.add_argument("batch_no", type=positive_int, help="批次号（十进制正整数）")
+
     return parser
 
 
@@ -130,6 +142,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_rows = ledger.rollback_batch(conn, args.source, args.batch_no)
             print(
                 f"Result: rollback {args.source} {args.batch_no} {total_rows}"
+            )
+        elif args.command == "fix-rejects":
+            result = importer.fix_rejects(conn, args.source, args.batch_no)
+            print(
+                f"Result: fix-rejects {result.source} {result.batch_no}"
+                f" {result.suspicious_rows}"
+            )
+        elif args.command == "apply-fixed":
+            result = importer.apply_fixed(conn, args.source, args.batch_no)
+            print(
+                f"Result: apply-fixed {result.source} {result.batch_no}"
+                f" {result.imported_rows} {result.duplicate_rows}"
+                f" {result.rejected_rows}"
             )
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS import_batches (
     duplicate_rows INTEGER NOT NULL,
     rejected_rows INTEGER NOT NULL,
     incremental_rows INTEGER NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'import',
     PRIMARY KEY (source_name, batch_no)
 );
 CREATE TABLE IF NOT EXISTS imported_records (
@@ -65,6 +66,15 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(db_path())
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(_SCHEMA)
+    with conn:  # 旧库迁移：import_batches 补 origin 列（import/reimport 批次来源）
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(import_batches)")
+        }
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE import_batches"
+                " ADD COLUMN origin TEXT NOT NULL DEFAULT 'import'"
+            )
     return conn
 
 
