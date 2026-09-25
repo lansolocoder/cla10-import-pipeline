@@ -44,3 +44,18 @@ python3 -m import_pipeline show-batch orders 1
 ```
 
 `run-import` 的 CSV 首行为表头，数据行按已登记的字段映射写入 `imported_rows`。出现未映射的源列、必需字段缺少映射目标对应列，或数据行的值为空白时整批拒绝：退出码 1、stderr 一行 `Error:`，批次状态记为 `rejected`，已校验行不落库；否则整批落库，退出码 0，stdout 输出 `Result: run-import <来源名> <成功行数>`，批次状态记为 `ok`。CSV 文件不存在时退出码 1 且不留批次记录。无论成功或拒绝都会在 `batches` 表留下批次记录：批次号（来源内从 1 递增）、来源名、状态、成功行数、被隔离行数。重复执行视为新批次，已有批次记录不变。`show-batch` 的来源名或批次号不存在时退出码 1、stderr 一行 `Error:`。
+
+## 增量导入与隔离记录
+
+```bash
+# 执行一次增量导入：以必需字段 id 为业务键，只写入此前批次未出现过的键
+python3 -m import_pipeline delta-import orders
+
+# 只读查询：列出来源全部隔离记录，每行：批次号、行号、原因、
+# 该行按目标列名排序后逗号连接的 列名=值 对（制表符分隔，按批次号与行号升序）
+python3 -m import_pipeline list-quarantine orders
+```
+
+`delta-import` 以来源配置声明的必需字段 `id` 作为业务键，按字符串精确匹配，不做大小写或空白归一。数据行的业务键若与此前任何批次已落库行相同，则该行是重复行：不写入也不报错，计入跳过行数；仅当业务键同时出现在本批多条数据行时，这些行视为冲突行。值为空白的行（原因 `blank-value`）与业务键冲突的行（原因 `duplicate-key`）都是被隔离行：逐行写入 `quarantined_rows`（行号取该行在 CSV 数据行中的序号，从 1 开始）并计入被隔离行数；其余行按字段映射写入 `imported_rows` 并计入成功行数。被隔离的键未落库，后续批次同键行仍可正常导入。
+
+正常完成时退出码 0，stdout 输出 `Result: delta-import <来源名> <新增行数> <跳过行数> <被隔离行数>`，并登记一条新批次记录：无被隔离行时状态为 `ok`，存在被隔离行时状态为 `failed`。表头含未映射源列、缺少必需字段（含业务键 `id`）对应列等整批级问题时整批拒绝：退出码 1、stderr 一行 `Error:`，批次状态记为 `rejected`，无任何行落库。CSV 文件不存在时退出码 1 且不留批次记录。`list-quarantine` 的来源名不存在时退出码 1、stderr 一行 `Error:`。

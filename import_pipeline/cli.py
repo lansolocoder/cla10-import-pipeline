@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_import.add_argument("source", help="已注册的来源名")
 
+    delta_import = subparsers.add_parser(
+        "delta-import", help="执行一次增量导入: 来源名"
+    )
+    delta_import.add_argument("source", help="已注册的来源名")
+
+    list_quarantine = subparsers.add_parser(
+        "list-quarantine", help="列出某来源的隔离记录"
+    )
+    list_quarantine.add_argument("source", help="已注册的来源名")
+
     show_batch = subparsers.add_parser(
         "show-batch", help="查询批次记录: 来源名 批次号"
     )
@@ -77,6 +87,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "run-import":
             count = ledger.run_import(conn, args.source)
             print(f"Result: run-import {args.source} {count}")
+        elif args.command == "delta-import":
+            inserted, skipped, quarantined = ledger.delta_import(conn, args.source)
+            print(
+                f"Result: delta-import {args.source}"
+                f" {inserted} {skipped} {quarantined}"
+            )
+        elif args.command == "list-quarantine":
+            for batch_no, row_number, reason, pairs in ledger.list_quarantine(
+                conn, args.source
+            ):
+                print(f"{batch_no}\t{row_number}\t{reason}\t{pairs}")
         elif args.command == "show-batch":
             for batch_no, status, succeeded, quarantined in ledger.show_batches(
                 conn, args.source, args.batch_no
