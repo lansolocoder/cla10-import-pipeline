@@ -48,6 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_mappings.add_argument("source", help="已注册的来源名")
 
+    add_rule = subparsers.add_parser(
+        "add-rule", help="注册校验规则: 来源名 字段名 类型 [边界或候选值]"
+    )
+    add_rule.add_argument("source", help="已注册的来源名")
+    add_rule.add_argument("field", help="该来源已声明的必需字段名")
+    add_rule.add_argument("rule_type", help="规则类型: decimal / date / enum")
+    add_rule.add_argument(
+        "spec",
+        nargs="?",
+        default=None,
+        help="decimal 的 min~max 边界（可省略）或 enum 的逗号分隔候选值（必填）",
+    )
+
+    rules_cmd = subparsers.add_parser(
+        "rules", help="列出某来源的全部校验规则（只读）"
+    )
+    rules_cmd.add_argument("source", help="已注册的来源名")
+
     import_cmd = subparsers.add_parser(
         "import", help="执行批次导入: 来源名"
     )
@@ -96,6 +114,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "list-mappings":
             for source_column, target_column in ledger.list_mappings(conn, args.source):
                 print(f"{source_column}\t{target_column}")
+        elif args.command == "add-rule":
+            count = ledger.add_rule(
+                conn, args.source, args.field, args.rule_type, args.spec
+            )
+            print(
+                f"Result: add-rule {args.source} {args.field}"
+                f" {args.rule_type} {count}"
+            )
+        elif args.command == "rules":
+            for field_name, rule_type, detail in ledger.list_rules(conn, args.source):
+                print(f"{field_name}\t{rule_type}\t{detail}")
+            print(f"Result: rules {args.source}")
         elif args.command == "import":
             result = importer.import_source(conn, args.source)
             print(

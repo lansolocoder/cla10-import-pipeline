@@ -12,7 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .ledger import LedgerError
+from .ledger import LedgerError, check_rule, load_rules
 
 
 @dataclass
@@ -85,9 +85,13 @@ def _classify_rows(
     header: list[str],
     mapping: dict[str, str],
     required: list[str],
+    rules: list[tuple],
     seen: set[str],
 ) -> tuple[int, int, list[list[str]], list[str]]:
-    """按既有行语义分类，返回 (成功数, 重复数, 失败行, 增量新签名)。"""
+    """按既有行语义分类，返回 (成功数, 重复数, 失败行, 增量新签名)。
+
+    行校验顺序固定为：列数与表头一致、必需字段非空、已注册规则全部通过。
+    """
     imported = 0
     duplicates = 0
     rejected: list[list[str]] = []
@@ -98,6 +102,12 @@ def _classify_rows(
             continue
         record = {mapping[column]: value for column, value in zip(header, raw)}
         if any(not record.get(field) for field in required):
+            rejected.append(raw)
+            continue
+        if any(
+            not check_rule(record.get(field_name, ""), rule_type, lo, hi, choices)
+            for field_name, rule_type, lo, hi, choices in rules
+        ):
             rejected.append(raw)
             continue
         signature = _row_signature(record)
@@ -125,6 +135,7 @@ def import_source(
     """执行一个批次的导入，返回结果计数；预检失败抛 LedgerError。"""
     data_rows, header, mapping, required = _prepare(conn, source)
 
+    rules = load_rules(conn, source)
     seen = {
         r[0]
         for r in conn.execute(
@@ -133,7 +144,7 @@ def import_source(
         )
     }
     imported, duplicates, rejected, new_signatures = _classify_rows(
-        data_rows, header, mapping, required, seen
+        data_rows, header, mapping, required, rules, seen
     )
 
     previous = conn.execute(
@@ -201,6 +212,7 @@ def reimport_source(
 
     data_rows, header, mapping, required = _prepare(conn, source)
 
+    rules = load_rules(conn, source)
     seen = {
         r[0]
         for r in conn.execute(
@@ -209,7 +221,7 @@ def reimport_source(
         )
     }
     imported, duplicates, rejected, new_signatures = _classify_rows(
-        data_rows, header, mapping, required, seen
+        data_rows, header, mapping, required, rules, seen
     )
 
     with conn:  # 删除旧签名、替换批次计数、写入新签名单次原子提交

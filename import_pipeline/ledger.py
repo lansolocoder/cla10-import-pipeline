@@ -6,8 +6,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from collections.abc import Sequence
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "import_ledger.db"
@@ -46,6 +49,15 @@ CREATE TABLE IF NOT EXISTS imported_records (
     signature TEXT NOT NULL,
     batch_no INTEGER NOT NULL,
     PRIMARY KEY (source_name, signature)
+);
+CREATE TABLE IF NOT EXISTS field_rules (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    field_name TEXT NOT NULL,
+    rule_type TEXT NOT NULL,
+    min_value TEXT,
+    max_value TEXT,
+    candidates TEXT,
+    PRIMARY KEY (source_name, field_name, rule_type)
 );
 """
 
@@ -157,6 +169,183 @@ def list_mappings(conn: sqlite3.Connection, source: str) -> list[tuple[str, str]
         " WHERE source_name = ? ORDER BY rowid",
         (source,),
     ).fetchall()
+
+
+# 校验规则类型；类型字面值只接受小写形式，其他写法一律拒绝。
+RULE_TYPES = ("decimal", "date", "enum")
+
+# 十进制数值：可选正负号，数字至多一个小数点，不允许空格或其他符号。
+_DECIMAL_VALUE = re.compile(r"[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)")
+# ISO 日期：严格的 YYYY-MM-DD 形式，是否真实存在另行校验。
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+def is_decimal_value(value: str) -> bool:
+    """判断是否为十进制数值写法（空格、多余小数点、其他符号均非法）。"""
+    return _DECIMAL_VALUE.fullmatch(value) is not None
+
+
+def is_iso_date(value: str) -> bool:
+    """判断是否为格式合法且真实存在的 YYYY-MM-DD 日期。"""
+    if _ISO_DATE.fullmatch(value) is None:
+        return False
+    try:
+        date(int(value[0:4]), int(value[5:7]), int(value[8:10]))
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_decimal_bounds(spec: str) -> tuple[str | None, str | None]:
+    """解析 `min~max` 形式的边界，任一侧可留空；非法时抛 LedgerError。"""
+    parts = spec.split("~")
+    if len(parts) != 2:
+        raise LedgerError(f"边界格式须为 min~max: {spec}")
+    low, high = parts
+    if not low and not high:
+        raise LedgerError("decimal 规则未指定边界")
+    for bound in (low, high):
+        if bound and not is_decimal_value(bound):
+            raise LedgerError(f"边界非数值: {bound}")
+    if low and high and Decimal(low) > Decimal(high):
+        raise LedgerError(f"最小值大于最大值: {low}~{high}")
+    return low or None, high or None
+
+
+def _parse_candidates(spec: str) -> str:
+    """校验逗号分隔的候选值列表（非空、无空项、不重复），原样返回。"""
+    items = spec.split(",")
+    if any(item == "" for item in items):
+        raise LedgerError(f"候选值含空项: {spec}")
+    if len(set(items)) != len(items):
+        raise LedgerError(f"候选值重复: {spec}")
+    return spec
+
+
+def add_rule(
+    conn: sqlite3.Connection,
+    source: str,
+    field: str,
+    rule_type: str,
+    spec: str | None = None,
+) -> int:
+    """注册校验规则，返回 1。校验失败或冲突时拒绝且已有规则保持原样。
+
+    spec 为 decimal 的 `min~max` 边界（可省略表示无边界）或 enum 的
+    逗号分隔候选值列表（必填）；date 不接受 spec。
+    """
+    _validate_token(source, "来源名")
+    _validate_token(field, "字段名")
+    if rule_type not in RULE_TYPES:
+        raise LedgerError(f"未知规则类型: {rule_type}")
+    min_value: str | None = None
+    max_value: str | None = None
+    candidates: str | None = None
+    if rule_type == "decimal":
+        if spec is not None:
+            min_value, max_value = _parse_decimal_bounds(spec)
+    elif rule_type == "date":
+        if spec is not None:
+            raise LedgerError("date 规则不接受边界或候选值参数")
+    else:  # enum
+        if spec is None:
+            raise LedgerError("enum 规则未指定候选值")
+        candidates = _parse_candidates(spec)
+    with conn:  # 单次操作原子提交，异常即回滚
+        if not conn.execute(
+            "SELECT 1 FROM sources WHERE name = ?", (source,)
+        ).fetchone():
+            raise LedgerError(f"来源不存在: {source}")
+        if not conn.execute(
+            "SELECT 1 FROM source_fields WHERE source_name = ? AND field_name = ?",
+            (source, field),
+        ).fetchone():
+            raise LedgerError(f"字段不是该来源已声明的必需字段: {field}")
+        if conn.execute(
+            "SELECT 1 FROM field_rules"
+            " WHERE source_name = ? AND field_name = ? AND rule_type = ?",
+            (source, field, rule_type),
+        ).fetchone():
+            raise LedgerError(f"规则已存在: {source} {field} {rule_type}")
+        conn.execute(
+            "INSERT INTO field_rules"
+            " (source_name, field_name, rule_type, min_value, max_value, candidates)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (source, field, rule_type, min_value, max_value, candidates),
+        )
+    return 1
+
+
+def list_rules(conn: sqlite3.Connection, source: str) -> list[tuple[str, str, str]]:
+    """按字段名、类型升序返回某来源的 (字段名, 类型, 边界或候选值)。
+
+    decimal 无边界与 date 的第三列为 `-`；来源不存在时拒绝。
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    rows = conn.execute(
+        "SELECT field_name, rule_type, min_value, max_value, candidates"
+        " FROM field_rules WHERE source_name = ?"
+        " ORDER BY field_name, rule_type",
+        (source,),
+    ).fetchall()
+    result = []
+    for field_name, rule_type, min_value, max_value, candidates in rows:
+        if rule_type == "enum":
+            detail = candidates
+        elif rule_type == "decimal" and (
+            min_value is not None or max_value is not None
+        ):
+            detail = f"{min_value or ''}~{max_value or ''}"
+        else:
+            detail = "-"
+        result.append((field_name, rule_type, detail))
+    return result
+
+
+def load_rules(
+    conn: sqlite3.Connection, source: str
+) -> list[tuple[str, str, str | None, str | None, tuple[str, ...] | None]]:
+    """按注册顺序返回某来源的规则，候选值已拆分为元组，供导入时逐行校验。"""
+    rows = conn.execute(
+        "SELECT field_name, rule_type, min_value, max_value, candidates"
+        " FROM field_rules WHERE source_name = ? ORDER BY rowid",
+        (source,),
+    ).fetchall()
+    return [
+        (
+            field_name,
+            rule_type,
+            min_value,
+            max_value,
+            tuple(candidates.split(",")) if candidates is not None else None,
+        )
+        for field_name, rule_type, min_value, max_value, candidates in rows
+    ]
+
+
+def check_rule(
+    value: str,
+    rule_type: str,
+    min_value: str | None,
+    max_value: str | None,
+    candidates: tuple[str, ...] | None,
+) -> bool:
+    """按单条规则校验字段值；任一条件不满足即返回 False。"""
+    if rule_type == "decimal":
+        if not is_decimal_value(value):
+            return False
+        number = Decimal(value)
+        if min_value is not None and number < Decimal(min_value):
+            return False
+        if max_value is not None and number > Decimal(max_value):
+            return False
+        return True
+    if rule_type == "date":
+        return is_iso_date(value)
+    return value in candidates  # enum：与候选值完全相等才通过
 
 
 def list_batches(
