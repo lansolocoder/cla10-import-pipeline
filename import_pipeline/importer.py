@@ -12,6 +12,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import rules
 from .ledger import LedgerError
 
 
@@ -36,8 +37,14 @@ def _row_signature(record: dict[str, str]) -> str:
 
 def _prepare(
     conn: sqlite3.Connection, source: str
-) -> tuple[list[list[str]], list[str], dict[str, str], list[str]]:
-    """预检并返回 (数据行, 表头, 源列->目标列映射, 必需字段列表)。"""
+) -> tuple[
+    list[list[str]],
+    list[str],
+    dict[str, str],
+    list[str],
+    list[tuple[str, str, str | None, str | None, str | None]],
+]:
+    """预检并返回 (数据行, 表头, 源列->目标列映射, 必需字段列表, 校验规则)。"""
     row = conn.execute(
         "SELECT csv_path FROM sources WHERE name = ?", (source,)
     ).fetchone()
@@ -77,7 +84,13 @@ def _prepare(
         if field not in mapped_targets:
             raise LedgerError(f"必需字段未全部映射: {field}")
 
-    return data_rows, header, mapping, required
+    rule_rows = conn.execute(
+        "SELECT field_name, rule_type, min_value, max_value, candidates"
+        " FROM validation_rules WHERE source_name = ? ORDER BY rowid",
+        (source,),
+    ).fetchall()
+
+    return data_rows, header, mapping, required, rule_rows
 
 
 def _classify_rows(
@@ -85,9 +98,13 @@ def _classify_rows(
     header: list[str],
     mapping: dict[str, str],
     required: list[str],
+    rule_rows: list[tuple[str, str, str | None, str | None, str | None]],
     seen: set[str],
 ) -> tuple[int, int, list[list[str]], list[str]]:
-    """按既有行语义分类，返回 (成功数, 重复数, 失败行, 增量新签名)。"""
+    """按既有行语义分类，返回 (成功数, 重复数, 失败行, 增量新签名)。
+
+    行校验顺序固定为：列数与表头一致、必需字段非空、已注册规则全部通过。
+    """
     imported = 0
     duplicates = 0
     rejected: list[list[str]] = []
@@ -98,6 +115,12 @@ def _classify_rows(
             continue
         record = {mapping[column]: value for column, value in zip(header, raw)}
         if any(not record.get(field) for field in required):
+            rejected.append(raw)
+            continue
+        if any(
+            not rules.rule_accepts(rule_type, record.get(field, ""), lo, hi, cands)
+            for field, rule_type, lo, hi, cands in rule_rows
+        ):
             rejected.append(raw)
             continue
         signature = _row_signature(record)
@@ -123,7 +146,7 @@ def import_source(
     conn: sqlite3.Connection, source: str, reject_dir: Path | None = None
 ) -> ImportResult:
     """执行一个批次的导入，返回结果计数；预检失败抛 LedgerError。"""
-    data_rows, header, mapping, required = _prepare(conn, source)
+    data_rows, header, mapping, required, rule_rows = _prepare(conn, source)
 
     seen = {
         r[0]
@@ -133,7 +156,7 @@ def import_source(
         )
     }
     imported, duplicates, rejected, new_signatures = _classify_rows(
-        data_rows, header, mapping, required, seen
+        data_rows, header, mapping, required, rule_rows, seen
     )
 
     previous = conn.execute(
@@ -199,7 +222,7 @@ def reimport_source(
     ).fetchone() is None:
         raise LedgerError(f"批次不存在: {source} #{batch_no}")
 
-    data_rows, header, mapping, required = _prepare(conn, source)
+    data_rows, header, mapping, required, rule_rows = _prepare(conn, source)
 
     seen = {
         r[0]
@@ -209,7 +232,7 @@ def reimport_source(
         )
     }
     imported, duplicates, rejected, new_signatures = _classify_rows(
-        data_rows, header, mapping, required, seen
+        data_rows, header, mapping, required, rule_rows, seen
     )
 
     with conn:  # 删除旧签名、替换批次计数、写入新签名单次原子提交

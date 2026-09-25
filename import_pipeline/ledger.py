@@ -10,6 +10,8 @@ import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
+from . import rules
+
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "import_ledger.db"
 
 # 布尔与状态字面值只接受小写形式；大小写不同的取值视为非法输入。
@@ -46,6 +48,15 @@ CREATE TABLE IF NOT EXISTS imported_records (
     signature TEXT NOT NULL,
     batch_no INTEGER NOT NULL,
     PRIMARY KEY (source_name, signature)
+);
+CREATE TABLE IF NOT EXISTS validation_rules (
+    source_name TEXT NOT NULL REFERENCES sources (name),
+    field_name TEXT NOT NULL,
+    rule_type TEXT NOT NULL,
+    min_value TEXT,
+    max_value TEXT,
+    candidates TEXT,
+    PRIMARY KEY (source_name, field_name, rule_type)
 );
 """
 
@@ -127,6 +138,116 @@ def add_mapping(
             (source, source_column, target_column),
         )
     return 1
+
+
+def _parse_decimal_bounds(
+    params: Sequence[str],
+) -> tuple[str | None, str | None]:
+    """解析 decimal 规则的边界参数，返回 (最小值, 最大值) 的文本形式。
+
+    接受 `min~max` 单参数写法（任一侧留空表示不限制）或 `min max`
+    双参数写法；边界须为十进制数值且最小值不大于最大值。
+    """
+    if len(params) > 2:
+        raise LedgerError("decimal 规则边界参数过多")
+    texts: list[str | None] = [param or None for param in params]
+    if len(params) == 1 and params[0] and "~" in params[0]:
+        low_text, _, high_text = params[0].partition("~")
+        if "~" in high_text:
+            raise LedgerError(f"边界格式非法: {params[0]}")
+        texts = [low_text or None, high_text or None]
+    min_value = texts[0] if len(texts) > 0 else None
+    max_value = texts[1] if len(texts) > 1 else None
+    for bound in (min_value, max_value):
+        if bound is not None and rules.parse_decimal(bound) is None:
+            raise LedgerError(f"边界非数值: {bound}")
+    if (
+        min_value is not None
+        and max_value is not None
+        and rules.parse_decimal(min_value) > rules.parse_decimal(max_value)
+    ):
+        raise LedgerError(f"最小值大于最大值: {min_value} > {max_value}")
+    return min_value, max_value
+
+
+def _parse_enum_candidates(params: Sequence[str]) -> str:
+    """解析 enum 规则的候选值列表：逗号分隔、非空、互不重复。"""
+    if not params:
+        raise LedgerError("enum 规则须指定逗号分隔的候选值列表")
+    if len(params) > 1:
+        raise LedgerError("enum 规则候选值须为单个逗号分隔参数")
+    candidates = params[0].split(",")
+    if any(not item for item in candidates):
+        raise LedgerError(f"候选值含空项: {params[0]}")
+    if len(set(candidates)) != len(candidates):
+        raise LedgerError(f"候选值重复: {params[0]}")
+    return params[0]
+
+
+def add_rule(
+    conn: sqlite3.Connection,
+    source: str,
+    field: str,
+    rule_type: str,
+    params: Sequence[str],
+) -> int:
+    """注册校验规则，返回 1。任何校验失败均拒绝且不落库。"""
+    _validate_token(source, "来源名")
+    _validate_token(field, "字段名")
+    if rule_type not in rules.RULE_TYPES:
+        raise LedgerError(f"未知规则类型: {rule_type}")
+    min_value: str | None = None
+    max_value: str | None = None
+    candidates: str | None = None
+    if rule_type == "decimal":
+        min_value, max_value = _parse_decimal_bounds(params)
+    elif rule_type == "date":
+        if params:
+            raise LedgerError("date 规则不接受边界或候选值参数")
+    else:
+        candidates = _parse_enum_candidates(params)
+    with conn:  # 单次操作原子提交，异常即回滚
+        if not conn.execute(
+            "SELECT 1 FROM sources WHERE name = ?", (source,)
+        ).fetchone():
+            raise LedgerError(f"来源不存在: {source}")
+        if not conn.execute(
+            "SELECT 1 FROM source_fields WHERE source_name = ? AND field_name = ?",
+            (source, field),
+        ).fetchone():
+            raise LedgerError(f"字段不是来源已声明的必需字段: {field}")
+        if conn.execute(
+            "SELECT 1 FROM validation_rules"
+            " WHERE source_name = ? AND field_name = ? AND rule_type = ?",
+            (source, field, rule_type),
+        ).fetchone():
+            raise LedgerError(f"规则已存在: {source} {field} {rule_type}")
+        conn.execute(
+            "INSERT INTO validation_rules"
+            " (source_name, field_name, rule_type, min_value, max_value, candidates)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (source, field, rule_type, min_value, max_value, candidates),
+        )
+    return 1
+
+
+def list_rules(
+    conn: sqlite3.Connection, source: str
+) -> list[tuple[str, str, str | None, str | None, str | None]]:
+    """按字段名、类型升序返回某来源的校验规则；来源不存在时拒绝。
+
+    每项为 (字段名, 类型, 最小值, 最大值, 候选值列表)。
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    return conn.execute(
+        "SELECT field_name, rule_type, min_value, max_value, candidates"
+        " FROM validation_rules WHERE source_name = ?"
+        " ORDER BY field_name, rule_type",
+        (source,),
+    ).fetchall()
 
 
 def list_sources(conn: sqlite3.Connection) -> list[tuple[str, str, list[str]]]:

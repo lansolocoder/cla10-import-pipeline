@@ -19,6 +19,17 @@ def positive_int(value: str) -> int:
     return int(value)
 
 
+def _rule_spec(
+    rule_type: str, min_value: str | None, max_value: str | None, candidates: str | None
+) -> str:
+    """rules 输出的第三列：decimal 为 min~max（缺省侧留空），enum 为候选值，其余为 -。"""
+    if rule_type == "enum":
+        return candidates or ""
+    if rule_type == "decimal" and (min_value is not None or max_value is not None):
+        return f"{min_value or ''}~{max_value or ''}"
+    return "-"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="import-pipeline",
@@ -42,6 +53,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_mapping.add_argument("target_column", help="目标列名")
 
     subparsers.add_parser("list-sources", help="列出全部来源配置")
+
+    add_rule = subparsers.add_parser(
+        "add-rule", help="注册校验规则: 来源名 字段名 类型 [边界或候选值]"
+    )
+    add_rule.add_argument("source", help="已注册的来源名")
+    add_rule.add_argument("field", help="该来源已声明的必需字段名")
+    add_rule.add_argument("rule_type", help="规则类型: decimal / date / enum")
+    add_rule.add_argument(
+        "params",
+        nargs="*",
+        help="decimal 为 min~max 边界（可省略或留空一侧），enum 为逗号分隔候选值",
+    )
+
+    rules_cmd = subparsers.add_parser(
+        "rules", help="列出某来源的全部校验规则（只读）"
+    )
+    rules_cmd.add_argument("source", help="已注册的来源名")
 
     list_mappings = subparsers.add_parser(
         "list-mappings", help="列出某来源的字段映射"
@@ -93,6 +121,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "list-sources":
             for name, csv_path, fields in ledger.list_sources(conn):
                 print(f"{name}\t{csv_path}\t{','.join(fields)}")
+        elif args.command == "add-rule":
+            count = ledger.add_rule(
+                conn, args.source, args.field, args.rule_type, args.params
+            )
+            print(
+                f"Result: add-rule {args.source} {args.field}"
+                f" {args.rule_type} {count}"
+            )
+        elif args.command == "rules":
+            for field, rule_type, lo, hi, candidates in ledger.list_rules(
+                conn, args.source
+            ):
+                print(f"{field}\t{rule_type}\t{_rule_spec(rule_type, lo, hi, candidates)}")
+            print(f"Result: rules {args.source}")
         elif args.command == "list-mappings":
             for source_column, target_column in ledger.list_mappings(conn, args.source):
                 print(f"{source_column}\t{target_column}")
