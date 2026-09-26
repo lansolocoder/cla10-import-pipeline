@@ -34,12 +34,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_source.add_argument("csv_path", help="CSV 文件路径")
     add_source.add_argument("fields", nargs="+", help="必需字段名（至少一个，不重复）")
 
+    update_source = subparsers.add_parser(
+        "update-source", help="修改已注册来源的 CSV 路径: 来源名 新CSV路径"
+    )
+    update_source.add_argument("name", help="已注册的来源名")
+    update_source.add_argument("csv_path", help="新的 CSV 文件路径（非空、非纯空白）")
+
+    retire_source = subparsers.add_parser(
+        "retire-source",
+        help="退役来源：删除来源、必需字段与全部映射（保留历史批次）",
+    )
+    retire_source.add_argument("name", help="已注册的来源名")
+
     add_mapping = subparsers.add_parser(
         "add-mapping", help="注册字段映射: 来源名 源列名 目标列名"
     )
     add_mapping.add_argument("source", help="已注册的来源名")
     add_mapping.add_argument("source_column", help="源列名（同一来源下唯一）")
     add_mapping.add_argument("target_column", help="目标列名")
+
+    remove_mapping = subparsers.add_parser(
+        "remove-mapping", help="删除一条字段映射: 来源名 源列名"
+    )
+    remove_mapping.add_argument("source", help="已注册的来源名")
+    remove_mapping.add_argument("source_column", help="已映射的源列名")
 
     subparsers.add_parser("list-sources", help="列出全部来源配置")
 
@@ -85,11 +103,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "add-source":
             count = ledger.add_source(conn, args.name, args.csv_path, args.fields)
             print(f"Result: add-source {args.name} {count}")
+        elif args.command == "update-source":
+            new_path = ledger.update_source_path(conn, args.name, args.csv_path)
+            print(f"Result: update-source {args.name} {new_path}")
+        elif args.command == "retire-source":
+            count = ledger.retire_source(conn, args.name)
+            print(f"Result: retire-source {args.name} {count}")
         elif args.command == "add-mapping":
             count = ledger.add_mapping(
                 conn, args.source, args.source_column, args.target_column
             )
             print(f"Result: add-mapping {args.source} {count}")
+        elif args.command == "remove-mapping":
+            column = ledger.remove_mapping(conn, args.source, args.source_column)
+            print(f"Result: remove-mapping {args.source} {column}")
         elif args.command == "list-sources":
             for name, csv_path, fields in ledger.list_sources(conn):
                 print(f"{name}\t{csv_path}\t{','.join(fields)}")

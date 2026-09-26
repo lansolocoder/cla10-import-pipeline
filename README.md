@@ -20,8 +20,17 @@ python3 -m unittest discover -s tests -v
 # 注册来源配置：来源名（唯一）、CSV 路径、至少一个必需字段名（非空、不重复）
 python3 -m import_pipeline add-source orders data/orders.csv id amount
 
+# 修改已注册来源的 CSV 路径：只接受一个已注册来源与新路径，路径须非空且非纯空白
+python3 -m import_pipeline update-source orders data/new.csv
+
+# 退役来源：删除来源本身、必需字段与全部字段映射（保留历史批次，见下节）
+python3 -m import_pipeline retire-source orders
+
 # 注册字段映射：来源名、源列名、目标列名；同一来源下源列名唯一
 python3 -m import_pipeline add-mapping orders order_id id
+
+# 删除一条字段映射：来源名、源列名；源列名无映射时报错且不改动
+python3 -m import_pipeline remove-mapping orders order_id
 
 # 只读查询：列出全部来源（来源名、路径、逗号连接的字段列表，制表符分隔）
 python3 -m import_pipeline list-sources
@@ -31,6 +40,20 @@ python3 -m import_pipeline list-mappings orders
 ```
 
 校验规则：来源名、路径、字段名、列名均须为非空字符串；布尔与状态字面值只接受小写 `true`/`false`/`ok`/`failed`/`rejected`，大小写不同（如 `TRUE`）视为非法输入并拒绝。重复注册来源名、重复字段名、同一来源下重复源列名、引用不存在的来源均被拒绝，且数据库保持执行前状态（单次操作原子提交）。
+
+`update-source` 只改来源登记的 CSV 路径，必需字段、字段映射、历史批次、导入签名与拒绝文件均不受影响；此后 `import` 与 `reimport` 一律读取新路径，历史批次行的语义不变。来源不存在或新路径为空、纯空白、含非法字面值时错误写 stderr、退出码 1，且路径保持原值。
+
+`remove-mapping` 删除指定来源下的一条字段映射；来源不存在或该源列名没有映射时错误写 stderr、退出码 1，且该来源的全部映射保持执行前状态。
+
+`retire-source` 在单个事务中删除来源本身、其全部必需字段与字段映射，但**不删除任何批次记录、导入签名与拒绝文件**：历史批次数据迁移到内部墓碑来源名下保留，使历史批次仍可在库中查询，磁盘上的拒绝文件也原样保留。退役后 `batches <来源名>` 因来源未注册而按既有规则报错退出 1；已退役的来源名可按 `add-source` 的全部校验与输出重新注册为新来源，重新注册后旧签名不再参与判重（再次导入的行一律计为增量新数据），批次号从 1 重新开始。Result 行末尾的条目数为本次删除的必需字段与字段映射总数：
+
+```
+Result: update-source <来源名> <新路径>
+Result: remove-mapping <来源名> <源列名>
+Result: retire-source <来源名> <条目数>
+```
+
+三项管理操作任一校验失败（来源不存在、参数非法、源列名无映射）时错误写 stderr、退出码 1，来源配置、映射与批次数据全部保持执行前状态；缺失参数等用法错误仍按 argparse 约定退出码 2。
 
 ## 批次导入
 

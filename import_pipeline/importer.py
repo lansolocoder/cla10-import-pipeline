@@ -39,7 +39,7 @@ def _prepare(
 ) -> tuple[list[list[str]], list[str], dict[str, str], list[str]]:
     """预检并返回 (数据行, 表头, 源列->目标列映射, 必需字段列表)。"""
     row = conn.execute(
-        "SELECT csv_path FROM sources WHERE name = ?", (source,)
+        "SELECT csv_path FROM sources WHERE name = ? AND retired = 0", (source,)
     ).fetchone()
     if row is None:
         raise LedgerError(f"来源不存在: {source}")
@@ -190,7 +190,7 @@ def reimport_source(
     来源或目标批次不存在、预检失败时抛 LedgerError，且不改动任何记录与文件。
     """
     if conn.execute(
-        "SELECT 1 FROM sources WHERE name = ?", (source,)
+        "SELECT 1 FROM sources WHERE name = ? AND retired = 0", (source,)
     ).fetchone() is None:
         raise LedgerError(f"来源不存在: {source}")
     if conn.execute(
