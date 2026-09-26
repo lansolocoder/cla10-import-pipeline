@@ -32,6 +32,21 @@ python3 -m import_pipeline list-mappings orders
 
 校验规则：来源名、路径、字段名、列名均须为非空字符串；布尔与状态字面值只接受小写 `true`/`false`/`ok`/`failed`/`rejected`，大小写不同（如 `TRUE`）视为非法输入并拒绝。重复注册来源名、重复字段名、同一来源下重复源列名、引用不存在的来源均被拒绝，且数据库保持执行前状态（单次操作原子提交）。
 
+## 来源配置管理
+
+```bash
+# 修改已注册来源的 CSV 路径：不影响已有批次、签名与拒绝文件，此后 import/reimport 读取新路径
+python3 -m import_pipeline update-source orders data/new.csv
+
+# 删除来源下一条字段映射：源列名不存在时报错且不改动
+python3 -m import_pipeline remove-mapping orders order_id
+
+# 退役来源：删除来源本身、必需字段与全部字段映射，但保留历史批次记录、导入签名与拒绝文件
+python3 -m import_pipeline retire-source orders
+```
+
+三条命令成功时分别打印 `Result: update-source <来源名> <新路径>`、`Result: remove-mapping <来源名> <源列名>`、`Result: retire-source <来源名> <条目数>`（条目数为删除的必需字段与字段映射总数）。任一校验失败（来源不存在、参数非法、源列名不存在）错误写 stderr、退出码 1，且全部数据保持执行前状态。`retire-source` 之后 `batches <来源名>` 因来源未注册而报错退出 1；旧签名不再参与判重，同名来源可重新注册，再次导入的行一律计为增量新数据，批次号从 1 重新开始。
+
 ## 批次导入
 
 ```bash

@@ -129,6 +129,102 @@ def add_mapping(
     return 1
 
 
+def update_source(conn: sqlite3.Connection, source: str, csv_path: str) -> None:
+    """修改已注册来源的 CSV 路径。来源不存在或路径非法时拒绝并保留原状。"""
+    _validate_token(source, "来源名")
+    _validate_token(csv_path, "文件路径")
+    with conn:  # 单次操作原子提交，异常即回滚
+        cursor = conn.execute(
+            "UPDATE sources SET csv_path = ? WHERE name = ?", (csv_path, source)
+        )
+        if cursor.rowcount == 0:
+            raise LedgerError(f"来源不存在: {source}")
+
+
+def remove_mapping(conn: sqlite3.Connection, source: str, source_column: str) -> None:
+    """删除来源下一条字段映射。来源或源列名不存在时拒绝并保留原状。"""
+    _validate_token(source, "来源名")
+    _validate_token(source_column, "源列名")
+    with conn:
+        if not conn.execute(
+            "SELECT 1 FROM sources WHERE name = ?", (source,)
+        ).fetchone():
+            raise LedgerError(f"来源不存在: {source}")
+        cursor = conn.execute(
+            "DELETE FROM field_mappings"
+            " WHERE source_name = ? AND source_column = ?",
+            (source, source_column),
+        )
+        if cursor.rowcount == 0:
+            raise LedgerError(f"源列名映射不存在: {source_column}")
+
+
+def _retired_name(conn: sqlite3.Connection, source: str) -> str:
+    """为退役来源的历史批次与签名生成不与任何现存键冲突的墓碑名。"""
+    n = 1
+    while True:
+        candidate = f"{source}#retired#{n}"
+        used = any(
+            conn.execute(
+                f"SELECT 1 FROM {table} WHERE {column} = ?", (candidate,)
+            ).fetchone()
+            for table, column in (
+                ("sources", "name"),
+                ("import_batches", "source_name"),
+                ("imported_records", "source_name"),
+            )
+        )
+        if not used:
+            return candidate
+        n += 1
+
+
+def retire_source(conn: sqlite3.Connection, source: str) -> int:
+    """退役来源：删除来源本身、其必需字段与全部字段映射，返回删除条目数。
+
+    批次记录与导入签名不删除，而是改挂到唯一的墓碑名下：历史数据保留在
+    台账中，但不再参与任何判重与批次编号，同名来源可重新注册、批次号从 1
+    重新开始。任一校验失败时不落库。
+    """
+    _validate_token(source, "来源名")
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    # 历史批次与签名改挂墓碑名后会暂时指向 sources 中不存在的名字，
+    # 需在事务外暂时关闭外键约束，提交后立即恢复。
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with conn:  # 来源、字段、映射与历史数据改名单次原子提交
+            fields = conn.execute(
+                "SELECT COUNT(*) FROM source_fields WHERE source_name = ?",
+                (source,),
+            ).fetchone()[0]
+            mappings = conn.execute(
+                "SELECT COUNT(*) FROM field_mappings WHERE source_name = ?",
+                (source,),
+            ).fetchone()[0]
+            tombstone = _retired_name(conn, source)
+            conn.execute(
+                "UPDATE import_batches SET source_name = ? WHERE source_name = ?",
+                (tombstone, source),
+            )
+            conn.execute(
+                "UPDATE imported_records SET source_name = ? WHERE source_name = ?",
+                (tombstone, source),
+            )
+            conn.execute(
+                "DELETE FROM field_mappings WHERE source_name = ?", (source,)
+            )
+            conn.execute(
+                "DELETE FROM source_fields WHERE source_name = ?", (source,)
+            )
+            conn.execute("DELETE FROM sources WHERE name = ?", (source,))
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+    return fields + mappings
+
+
 def list_sources(conn: sqlite3.Connection) -> list[tuple[str, str, list[str]]]:
     """按注册顺序返回 (来源名, 文件路径, 字段名列表)。"""
     rows = conn.execute("SELECT name, csv_path FROM sources ORDER BY rowid").fetchall()

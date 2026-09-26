@@ -41,6 +41,23 @@ def build_parser() -> argparse.ArgumentParser:
     add_mapping.add_argument("source_column", help="源列名（同一来源下唯一）")
     add_mapping.add_argument("target_column", help="目标列名")
 
+    update_source = subparsers.add_parser(
+        "update-source", help="修改已注册来源的 CSV 路径: 来源名 新路径"
+    )
+    update_source.add_argument("source", help="已注册的来源名")
+    update_source.add_argument("csv_path", help="新的 CSV 文件路径（非空）")
+
+    remove_mapping = subparsers.add_parser(
+        "remove-mapping", help="删除来源下一条字段映射: 来源名 源列名"
+    )
+    remove_mapping.add_argument("source", help="已注册的来源名")
+    remove_mapping.add_argument("source_column", help="待删除的源列名")
+
+    retire_source = subparsers.add_parser(
+        "retire-source", help="退役来源: 删除来源配置与映射，保留历史批次"
+    )
+    retire_source.add_argument("source", help="已注册的来源名")
+
     subparsers.add_parser("list-sources", help="列出全部来源配置")
 
     list_mappings = subparsers.add_parser(
@@ -90,6 +107,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.source_column, args.target_column
             )
             print(f"Result: add-mapping {args.source} {count}")
+        elif args.command == "update-source":
+            ledger.update_source(conn, args.source, args.csv_path)
+            print(f"Result: update-source {args.source} {args.csv_path}")
+        elif args.command == "remove-mapping":
+            ledger.remove_mapping(conn, args.source, args.source_column)
+            print(f"Result: remove-mapping {args.source} {args.source_column}")
+        elif args.command == "retire-source":
+            count = ledger.retire_source(conn, args.source)
+            print(f"Result: retire-source {args.source} {count}")
         elif args.command == "list-sources":
             for name, csv_path, fields in ledger.list_sources(conn):
                 print(f"{name}\t{csv_path}\t{','.join(fields)}")
