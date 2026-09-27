@@ -73,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
     batch_stats.add_argument("start_batch", help="起始批次号（含，正整数）")
     batch_stats.add_argument("end_batch", help="结束批次号（含，正整数）")
 
+    batch_report = subparsers.add_parser(
+        "batch-report",
+        help="一次只读扫描给出区间内 ok/rejected/revoked 三段汇总与明细:"
+        " 来源名 起始批次号 结束批次号",
+    )
+    batch_report.add_argument("source", help="已注册的来源名")
+    batch_report.add_argument("start_batch", help="起始批次号（含，正整数）")
+    batch_report.add_argument("end_batch", help="结束批次号（含，正整数）")
+
     batch_stats_detail = subparsers.add_parser(
         "batch-stats-detail",
         help="区间内指定状态批次明细: 来源名 起始批次号 结束批次号 状态",
@@ -99,6 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "find-dupes",
         "batch-stats",
         "batch-stats-detail",
+        "batch-report",
     )
     conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
@@ -141,6 +151,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.start_batch, args.end_batch
             )
             print("\t".join(str(value) for value in stats))
+        elif args.command == "batch-report":
+            sections = ledger.batch_report(
+                conn, args.source, args.start_batch, args.end_batch
+            )
+            blocks = []
+            for status, batch_count, succeeded_total, quarantined_total, details in sections:
+                lines = [
+                    f"{status}:{batch_count}:{succeeded_total}:{quarantined_total}"
+                ]
+                lines.extend(
+                    f"{batch_no}\t{succeeded}\t{quarantined}"
+                    for batch_no, succeeded, quarantined in details
+                )
+                blocks.append("\n".join(lines))
+            print("\n---\n".join(blocks))
         elif args.command == "batch-stats-detail":
             for batch_no, succeeded, quarantined in ledger.batch_stats_detail(
                 conn, args.source, args.start_batch, args.end_batch, args.status
