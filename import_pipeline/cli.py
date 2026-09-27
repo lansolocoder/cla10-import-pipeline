@@ -93,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="批次状态（只接受小写 ok、rejected、revoked）"
     )
 
+    batch_reconcile = subparsers.add_parser(
+        "batch-reconcile",
+        help="对账 batch-report 与 batch-stats/batch-stats-detail 两路口径:"
+        " 来源名 起始批次号 结束批次号",
+    )
+    batch_reconcile.add_argument("source", help="已注册的来源名")
+    batch_reconcile.add_argument("start_batch", help="起始批次号（含，正整数）")
+    batch_reconcile.add_argument("end_batch", help="结束批次号（含，正整数）")
+
     return parser
 
 
@@ -109,6 +118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "batch-stats",
         "batch-stats-detail",
         "batch-report",
+        "batch-reconcile",
     )
     conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
@@ -171,6 +181,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.start_batch, args.end_batch, args.status
             ):
                 print(f"{batch_no}\t{succeeded}\t{quarantined}")
+        elif args.command == "batch-reconcile":
+            mismatches = ledger.batch_reconcile(
+                conn, args.source, args.start_batch, args.end_batch
+            )
+            if mismatches:
+                for field, report_value, other_value in mismatches:
+                    print(
+                        f"Mismatch: {field} batch-report={report_value}"
+                        f" other={other_value}"
+                    )
+                return 1
+            print(
+                f"Result: batch-reconcile {args.source}"
+                f" {args.start_batch} {args.end_batch} consistent"
+            )
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

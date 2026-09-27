@@ -3,6 +3,7 @@
 from pathlib import Path
 import hashlib
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -618,6 +619,150 @@ class ReadonlyQueryTests(unittest.TestCase):
         for arguments in invalid:
             with self.subTest(arguments=arguments):
                 result = self.invoke("batch-report", *arguments)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("Error:"))
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.db_digest(), self.digest_before)
+
+    def test_batch_reconcile_ok_then_reject_then_revoke_is_consistent(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        self.digest_before = self.db_digest()
+        result = self.invoke("batch-reconcile", "orders", "1", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["Result: batch-reconcile orders 1 2 consistent"],
+        )
+        self.assertEqual(result.stderr, "")
+        self.assert_readonly(result)
+
+    def test_batch_reconcile_consistent_with_all_three_statuses(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n4,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.import_rows("order_id,total\n5,50\n")
+        self.assertEqual(self.invoke("revoke-batch", "orders", "3").returncode, 0)
+        result = self.invoke("batch-reconcile", "orders", "1", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["Result: batch-reconcile orders 1 3 consistent"],
+        )
+
+    def test_batch_reconcile_empty_range_is_consistent(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.digest_before = self.db_digest()
+        for arguments in [("orders", "2", "3"), ("orders", "9", "100")]:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-reconcile", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        f"Result: batch-reconcile {arguments[0]}"
+                        f" {arguments[1]} {arguments[2]} consistent"
+                    ],
+                )
+                self.assertEqual(self.db_digest(), self.digest_before)
+
+    def test_batch_reconcile_range_bounds_are_inclusive(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.import_rows("order_id,total\n2,20\n3,30\n")
+        self.import_rows("order_id,total\n4,40\n")
+        result = self.invoke("batch-reconcile", "orders", "2", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["Result: batch-reconcile orders 2 2 consistent"],
+        )
+        result = self.invoke("batch-reconcile", "orders", "2", "9")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["Result: batch-reconcile orders 2 9 consistent"],
+        )
+
+    def test_batch_reconcile_reports_mismatches_in_field_order(self) -> None:
+        self.register_orders()
+        # 直接写入两路语义无法同时解释的批次：未识别状态只进 batch-stats 口径。
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO batches"
+                " (source_name, batch_no, status, succeeded_rows, quarantined_rows)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("orders", 1, "failed", 5, 7),
+            )
+        self.digest_before = self.db_digest()
+        result = self.invoke("batch-reconcile", "orders", "1", "1")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "Mismatch: total_batches batch-report=0 other=1",
+                "Mismatch: succeeded_rows batch-report=0 other=5",
+                "Mismatch: quarantined_rows batch-report=0 other=7",
+            ],
+        )
+        self.assertNotIn("consistent", result.stdout)
+        self.assert_readonly(result)
+
+    def test_batch_reconcile_does_not_change_other_query_results(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        commands = [
+            ("show-batch", "orders", "1"),
+            ("show-rows", "orders", "1"),
+            ("find-dupes", "orders", "amount"),
+            ("batch-stats", "orders", "1", "2"),
+            ("batch-stats-detail", "orders", "1", "2", "revoked"),
+            ("batch-report", "orders", "1", "2"),
+        ]
+        before = {command: self.invoke(*command) for command in commands}
+        reconcile = self.invoke("batch-reconcile", "orders", "1", "2")
+        self.assertEqual(reconcile.returncode, 0, reconcile.stderr)
+        for command in commands:
+            after = self.invoke(*command)
+            self.assertEqual(
+                (after.returncode, after.stdout, after.stderr),
+                (
+                    before[command].returncode,
+                    before[command].stdout,
+                    before[command].stderr,
+                ),
+                command,
+            )
+
+    def test_batch_reconcile_rejects_invalid_arguments(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.digest_before = self.db_digest()
+        invalid = [
+            ("missing", "1", "2"),
+            ("TRUE", "1", "2"),
+            ("  ", "1", "2"),
+            ("orders", "0", "2"),
+            ("orders", "-1", "2"),
+            ("orders", "1", "0"),
+            ("orders", "2", "-3"),
+            ("orders", "abc", "2"),
+            ("orders", "1", "2.5"),
+            ("orders", "2", "1"),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-reconcile", *arguments)
                 self.assertEqual(result.returncode, 1)
                 self.assertTrue(result.stderr.startswith("Error:"))
                 self.assertEqual(len(result.stderr.strip().splitlines()), 1)
