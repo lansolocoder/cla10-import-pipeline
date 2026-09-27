@@ -71,11 +71,29 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly() -> sqlite3.Connection:
+    """只读连接：以 mode=ro 打开台账，任何路径都不会写入数据库文件。
+
+    台账文件不存在时返回带空表的内存连接，查询结果等同于空台账。
+    """
+    path = db_path()
+    if path.is_file():
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(_SCHEMA)
+    return conn
+
+
 def _validate_token(value: str, label: str) -> None:
     if not value or not value.strip():
         raise LedgerError(f"{label}不能为空")
     if value.lower() in RESERVED_LITERALS and value not in RESERVED_LITERALS:
         raise LedgerError(f"{label}含非法字面值: {value}")
+
+
+def _validate_batch_no(batch_no: int) -> None:
+    if not isinstance(batch_no, int) or isinstance(batch_no, bool) or batch_no <= 0:
+        raise LedgerError(f"批次号必须为正整数: {batch_no}")
 
 
 def add_source(
@@ -276,8 +294,7 @@ def revoke_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> None:
     仅允许撤销 ok 批次；来源/批次不存在或状态非 ok 时拒绝且不留任何变更。
     """
     _validate_token(source, "来源名")
-    if not isinstance(batch_no, int) or isinstance(batch_no, bool) or batch_no <= 0:
-        raise LedgerError(f"批次号必须为正整数: {batch_no}")
+    _validate_batch_no(batch_no)
     if not conn.execute(
         "SELECT 1 FROM sources WHERE name = ?", (source,)
     ).fetchone():
@@ -328,3 +345,80 @@ def show_batches(
         " ORDER BY batch_no",
         (source, batch_no),
     ).fetchall()
+
+
+def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]:
+    """返回某来源指定批次的已导入行，每行为 "行号\\t规范化 JSON"。
+
+    规范化 JSON：对象键按目标列名字典序排序，值均为字符串。仅 ok 批次有行；
+    rejected 批次本无行、revoked 批次的行已删除，均返回空列表。
+    来源名或批次号不存在时拒绝。只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    _validate_batch_no(batch_no)
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    row = conn.execute(
+        "SELECT status FROM batches WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone()
+    if row is None:
+        raise LedgerError(f"批次不存在: {batch_no}")
+    if row[0] != "ok":
+        return []
+    lines = []
+    for row_number, data in conn.execute(
+        "SELECT row_number, data FROM imported_rows"
+        " WHERE source_name = ? AND batch_no = ? ORDER BY row_number",
+        (source, batch_no),
+    ):
+        normalized = json.dumps(
+            json.loads(data), ensure_ascii=False, sort_keys=True
+        )
+        lines.append(f"{row_number}\t{normalized}")
+    return lines
+
+
+def find_dupes(
+    conn: sqlite3.Connection, source: str, target_column: str
+) -> list[tuple[str, int, list[int]]]:
+    """按目标列值统计某来源未撤销批次已落库行的重复组。
+
+    返回 (目标列值, 出现次数, 升序去重批次号列表)，按目标列值升序；
+    仅保留出现两行及以上的组。已撤销批次的行不参与统计。
+    来源不存在、来源名非法、目标列名为空或目标列不存在于任何已落库行时拒绝。
+    只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    if not target_column or not target_column.strip():
+        raise LedgerError("目标列名不能为空")
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    rows = conn.execute(
+        "SELECT r.batch_no, r.data FROM imported_rows r"
+        " JOIN batches b"
+        " ON b.source_name = r.source_name AND b.batch_no = r.batch_no"
+        " WHERE r.source_name = ? AND b.status != 'revoked'",
+        (source,),
+    ).fetchall()
+    known_columns: set[str] = set()
+    counts: dict[str, int] = {}
+    batches_by_value: dict[str, set[int]] = {}
+    for batch_no, data in rows:
+        record = json.loads(data)
+        known_columns.update(record)
+        if target_column in record:
+            value = record[target_column]
+            counts[value] = counts.get(value, 0) + 1
+            batches_by_value.setdefault(value, set()).add(batch_no)
+    if target_column not in known_columns:
+        raise LedgerError(f"目标列不存在: {target_column}")
+    return [
+        (value, counts[value], sorted(batches_by_value[value]))
+        for value in sorted(counts)
+        if counts[value] >= 2
+    ]

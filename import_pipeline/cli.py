@@ -54,6 +54,18 @@ def build_parser() -> argparse.ArgumentParser:
     revoke_batch.add_argument("source", help="已注册的来源名")
     revoke_batch.add_argument("batch_no", type=int, help="待撤销批次号（正整数）")
 
+    show_rows = subparsers.add_parser(
+        "show-rows", help="列出批次已导入行: 来源名 批次号"
+    )
+    show_rows.add_argument("source", help="已注册的来源名")
+    show_rows.add_argument("batch_no", type=int, help="批次号（正整数）")
+
+    find_dupes = subparsers.add_parser(
+        "find-dupes", help="按目标列值查找重复行: 来源名 目标列名"
+    )
+    find_dupes.add_argument("source", help="已注册的来源名")
+    find_dupes.add_argument("target_column", help="目标列名")
+
     return parser
 
 
@@ -64,7 +76,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    conn = ledger.connect()
+    readonly = args.command in ("show-rows", "find-dupes")
+    conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
         if args.command == "add-source":
             count = ledger.add_source(conn, args.name, args.csv_path, args.fields)
@@ -91,6 +104,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.batch_no
             ):
                 print(f"{batch_no}\t{status}\t{succeeded}\t{quarantined}")
+        elif args.command == "show-rows":
+            for line in ledger.show_rows(conn, args.source, args.batch_no):
+                print(line)
+        elif args.command == "find-dupes":
+            for value, count, batch_numbers in ledger.find_dupes(
+                conn, args.source, args.target_column
+            ):
+                batches = ",".join(str(batch_no) for batch_no in batch_numbers)
+                print(f"{value}\t{count}\t{batches}")
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

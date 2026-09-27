@@ -49,3 +49,23 @@ python3 -m import_pipeline revoke-batch orders 1
 `run-import` 的 CSV 首行为表头，数据行按已登记的字段映射写入 `imported_rows`。出现未映射的源列、必需字段缺少映射目标对应列，或数据行的值为空白时整批拒绝：退出码 1、stderr 一行 `Error:`，批次状态记为 `rejected`，已校验行不落库；否则整批落库，退出码 0，stdout 输出 `Result: run-import <来源名> <成功行数>`，批次状态记为 `ok`。CSV 文件不存在时退出码 1 且不留批次记录。无论成功或拒绝都会在 `batches` 表留下批次记录：批次号（来源内从 1 递增）、来源名、状态、成功行数、被隔离行数。重复执行视为新批次，已有批次记录不变。`show-batch` 的来源名或批次号不存在时退出码 1、stderr 一行 `Error:`。
 
 `revoke-batch <来源名> <批次号>` 用于业务回滚：仅允许撤销状态为 `ok` 的批次。撤销成功时退出码 0，stdout 输出 `Result: revoke-batch <来源名> <批次号>`，该批次状态变为 `revoked`、其 `imported_rows` 行全部删除，成功行数与被隔离行数保留撤销前数值不变；其他批次的批次记录与已导入行一律保持原状。删除行与状态翻转在同一事务内原子完成，中途任何失败都会整体回滚，不留部分删除。对同一批次再次撤销，或对状态非 `ok`（如 `rejected`、`revoked`）的批次撤销，退出码 1、stderr 一行 `Error:`、stdout 无输出且数据库不变；来源名或批次号不存在同样拒绝。校验沿用既有规则：来源名须为非空字符串且大小写不同的保留字面值（如 `TRUE`）视为非法；批次号为正整数，零或负数按业务规则拒绝（退出码 1、stderr 一行 `Error:`）。撤销后可用 `show-batch` 查看，该批次状态列显示小写 `revoked`。
+
+## 行级只读查询
+
+```bash
+# 只读查询：列出某来源指定批次的已导入行，
+# 每行：行号、该行数据的规范化 JSON（键按目标列名字典序排序，值为字符串），
+# 制表符分隔，按行号升序
+python3 -m import_pipeline show-rows orders 1
+
+# 只读查询：按目标列值统计未撤销批次已落库行的重复组，
+# 每行：目标列值、出现次数、逗号分隔的升序去重批次号列表，
+# 制表符分隔，按目标列值升序
+python3 -m import_pipeline find-dupes orders amount
+```
+
+`show-rows` 仅 `ok` 批次有行；`rejected` 批次本无行、`revoked` 批次的行已在撤销时删除，两者均输出为空且退出码 0。来源名或批次号不存在时退出码 1、stderr 一行 `Error:`、stdout 无输出；批次号校验沿用既有规则（正整数，零或负数拒绝）。
+
+`find-dupes` 统计当前未撤销批次（`ok` 与 `rejected`）中已落库的 `imported_rows`：同一目标列值出现于两行及以上即为一个重复组；已撤销批次的行不参与统计，因此撤销批次后重复组相应缩小。目标列不存在于任何已落库行、来源不存在、来源名非法或目标列名为空时，退出码 1、stderr 一行 `Error:`、stdout 无输出。
+
+两个查询均为只读：任何情况下（包括拒绝路径）都不写入或修改 `import_ledger.db`。
