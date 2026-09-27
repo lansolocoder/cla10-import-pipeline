@@ -410,6 +410,42 @@ def batch_stats(
     )
 
 
+BATCH_STATUSES = frozenset({"ok", "rejected", "revoked"})
+
+
+def batch_stats_detail(
+    conn: sqlite3.Connection, source: str, start_batch: str, end_batch: str, status: str
+) -> list[tuple[int, int, int]]:
+    """返回某来源批次号闭区间 [start_batch, end_batch] 内指定状态的批次明细。
+
+    每行为 (批次号, 成功行数, 被隔离行数)，按批次号升序；区间内没有该状态的
+    批次时返回空列表。revoked 批次按撤销前保留值原样返回两个行数；rejected
+    批次成功行数为 0。状态只接受小写 ok、rejected、revoked。来源不存在、
+    来源名非法、批次号非正整数、起始批次号大于结束批次号或状态取值非法时
+    拒绝。只读操作，不落库；明细与 batch_stats 汇总来自同一张表的一致口径。
+    """
+    _validate_token(source, "来源名")
+    start_no = _parse_positive_int(start_batch, "起始批次号")
+    end_no = _parse_positive_int(end_batch, "结束批次号")
+    if start_no > end_no:
+        raise LedgerError(
+            f"起始批次号不能大于结束批次号: {start_no} > {end_no}"
+        )
+    if status not in BATCH_STATUSES:
+        raise LedgerError(f"状态取值非法: {status}")
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    return conn.execute(
+        "SELECT batch_no, succeeded_rows, quarantined_rows FROM batches"
+        " WHERE source_name = ? AND batch_no >= ? AND batch_no <= ?"
+        " AND status = ?"
+        " ORDER BY batch_no",
+        (source, start_no, end_no, status),
+    ).fetchall()
+
+
 def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]:
     """返回某来源指定批次的已导入行，每行为 "行号\\t规范化 JSON"。
 
