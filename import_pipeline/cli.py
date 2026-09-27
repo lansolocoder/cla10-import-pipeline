@@ -84,6 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="批次状态（只接受小写 ok、rejected、revoked）"
     )
 
+    batch_report = subparsers.add_parser(
+        "batch-report",
+        help="区间内三类状态的汇总与明细（一次只读扫描）: 来源名 起始批次号 结束批次号",
+    )
+    batch_report.add_argument("source", help="已注册的来源名")
+    batch_report.add_argument("start_batch", help="起始批次号（含，正整数）")
+    batch_report.add_argument("end_batch", help="结束批次号（含，正整数）")
+
     return parser
 
 
@@ -99,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "find-dupes",
         "batch-stats",
         "batch-stats-detail",
+        "batch-report",
     )
     conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
@@ -146,6 +155,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.start_batch, args.end_batch, args.status
             ):
                 print(f"{batch_no}\t{succeeded}\t{quarantined}")
+        elif args.command == "batch-report":
+            report = ledger.batch_report(
+                conn, args.source, args.start_batch, args.end_batch
+            )
+            blocks: list[str] = []
+            for status in ("ok", "rejected", "revoked"):
+                count, succeeded_total, quarantined_total, details = report[status]
+                lines = [
+                    f"{status}:{count}:{succeeded_total}:{quarantined_total}"
+                ]
+                lines.extend(
+                    f"{batch_no}\t{succeeded}\t{quarantined}"
+                    for batch_no, succeeded, quarantined in details
+                )
+                blocks.append("\n".join(lines))
+            print("\n---\n".join(blocks))
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -446,6 +446,56 @@ def batch_stats_detail(
     ).fetchall()
 
 
+def batch_report(
+    conn: sqlite3.Connection,
+    source: str,
+    start_batch: str,
+    end_batch: str,
+) -> dict[str, tuple[int, int, int, list[tuple[int, int, int]]]]:
+    """在一次只读扫描里给出闭区间 [start_batch, end_batch] 内三类状态的汇总与明细。
+
+    返回以 ok/rejected/revoked 为键的字典；每项为
+    (批次数, 成功行合计, 被隔离行合计, 明细列表)，明细列表元素为
+    (批次号, 成功行数, 被隔离行数)，按批次号升序。三段数字来自同一次
+    只读扫描的一致快照。revoked 批次按撤销前保留值输出并计入合计；
+    rejected 批次成功行数为 0。区间内无批次时三段计数全 0、明细为空。
+    来源不存在、来源名非法、批次号非正整数或起始批次号大于结束批次号时拒绝。
+    只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    start_no = _parse_positive_int(start_batch, "起始批次号")
+    end_no = _parse_positive_int(end_batch, "结束批次号")
+    if start_no > end_no:
+        raise LedgerError(
+            f"起始批次号不能大于结束批次号: {start_no} > {end_no}"
+        )
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    rows = conn.execute(
+        "SELECT batch_no, status, succeeded_rows, quarantined_rows FROM batches"
+        " WHERE source_name = ? AND batch_no >= ? AND batch_no <= ?"
+        " ORDER BY batch_no",
+        (source, start_no, end_no),
+    ).fetchall()
+    sections: dict[str, list] = {
+        status: [0, 0, 0, []] for status in ("ok", "rejected", "revoked")
+    }
+    for batch_no, status, succeeded, quarantined in rows:
+        section = sections.get(status)
+        if section is None:
+            continue
+        section[0] += 1
+        section[1] += succeeded
+        section[2] += quarantined
+        section[3].append((batch_no, succeeded, quarantined))
+    return {
+        status: (section[0], section[1], section[2], section[3])
+        for status, section in sections.items()
+    }
+
+
 def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]:
     """返回某来源指定批次的已导入行，每行为 "行号\\t规范化 JSON"。
 
