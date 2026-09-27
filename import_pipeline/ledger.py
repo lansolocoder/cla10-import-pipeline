@@ -306,6 +306,91 @@ def revoke_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> None:
         raise LedgerError(f"批次撤销失败: {exc}") from exc
 
 
+def _validate_batch_no(batch_no: int) -> None:
+    if not isinstance(batch_no, int) or isinstance(batch_no, bool) or batch_no <= 0:
+        raise LedgerError(f"批次号必须为正整数: {batch_no}")
+
+
+def _require_source(conn: sqlite3.Connection, source: str) -> None:
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+
+
+def _normalize_row_data(data: str) -> str:
+    """规范化行数据：键按目标列名字典序排序，值一律转为字符串。"""
+    obj = json.loads(data)
+    return json.dumps(
+        {key: str(value) for key, value in obj.items()},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def show_rows(
+    conn: sqlite3.Connection, source: str, batch_no: int
+) -> list[tuple[int, str]]:
+    """返回某来源指定批次的已导入行：(行号, 规范化 JSON 文本)，按行号升序。
+
+    rejected 批次未落库行、revoked 批次的行已删除，均返回空列表；
+    来源或批次不存在时拒绝。只读查询，不写入数据库。
+    """
+    _validate_token(source, "来源名")
+    _validate_batch_no(batch_no)
+    _require_source(conn, source)
+    if not conn.execute(
+        "SELECT 1 FROM batches WHERE source_name = ? AND batch_no = ?",
+        (source, batch_no),
+    ).fetchone():
+        raise LedgerError(f"批次不存在: {batch_no}")
+    rows = conn.execute(
+        "SELECT row_number, data FROM imported_rows"
+        " WHERE source_name = ? AND batch_no = ? ORDER BY row_number",
+        (source, batch_no),
+    ).fetchall()
+    return [(row_number, _normalize_row_data(data)) for row_number, data in rows]
+
+
+def find_dupes(
+    conn: sqlite3.Connection, source: str, target_column: str
+) -> list[tuple[str, int, list[int]]]:
+    """按目标列值统计重复组：(列值, 出现次数, 升序去重批次号列表)。
+
+    仅统计当前未撤销批次（ok 与 rejected）中已落库的 imported_rows；
+    同值出现于两行或更多行即为一个重复组，按列值升序返回。
+    来源不存在、来源名非法、目标列名为空或目标列未出现于任何已落库行时拒绝。
+    只读查询，不写入数据库。
+    """
+    _validate_token(source, "来源名")
+    if not target_column or not target_column.strip():
+        raise LedgerError("目标列名不能为空")
+    _require_source(conn, source)
+    rows = conn.execute(
+        "SELECT ir.batch_no, ir.data FROM imported_rows ir"
+        " JOIN batches b"
+        "   ON b.source_name = ir.source_name AND b.batch_no = ir.batch_no"
+        " WHERE ir.source_name = ? AND b.status IN ('ok', 'rejected')",
+        (source,),
+    ).fetchall()
+    counts: dict[str, int] = {}
+    batch_nos: dict[str, set[int]] = {}
+    for batch_no, data in rows:
+        obj = json.loads(data)
+        if target_column not in obj:
+            continue
+        value = str(obj[target_column])
+        counts[value] = counts.get(value, 0) + 1
+        batch_nos.setdefault(value, set()).add(batch_no)
+    if not counts:
+        raise LedgerError(f"目标列不存在: {target_column}")
+    return [
+        (value, counts[value], sorted(batch_nos[value]))
+        for value in sorted(counts)
+        if counts[value] >= 2
+    ]
+
+
 def show_batches(
     conn: sqlite3.Connection, source: str, batch_no: int
 ) -> list[tuple[int, str, int, int]]:
