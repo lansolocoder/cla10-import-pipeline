@@ -74,6 +74,9 @@ python3 -m import_pipeline batch-stats-detail orders 1 3 ok
 
 # 只读查询：一次扫描同时给出区间内 ok、rejected、revoked 三段的汇总与明细
 python3 -m import_pipeline batch-report orders 1 3
+
+# 只读查询：一次只读扫描内对账 batch-report 与 batch-stats/batch-stats-detail 两路口径
+python3 -m import_pipeline batch-reconcile orders 1 3
 ```
 
 `show-rows` 仅 `ok` 批次有行；`rejected` 批次本无行、`revoked` 批次的行已在撤销时删除，两者均输出为空且退出码 0。来源名或批次号不存在时退出码 1、stderr 一行 `Error:`、stdout 无输出；批次号校验沿用既有规则（正整数，零或负数拒绝）。
@@ -86,4 +89,6 @@ python3 -m import_pipeline batch-report orders 1 3
 
 `batch-report <来源名> <起始批次号> <结束批次号>` 在一次只读扫描里给出批次号闭区间（含两端）内 `ok`、`rejected`、`revoked` 三类状态的汇总与明细，三段数字同出一份一致快照。输出按 `ok`、`rejected`、`revoked` 固定顺序分三段，段间单独一行 `---` 分隔（某段无批次也保留该段）。每段首行为汇总行 `<状态>:<批次数>:<成功行合计>:<被隔离行合计>`（后三列为十进制数字、冒号分隔），随后为该状态的明细行，每行三个制表符分隔的十进制数字：批次号、成功行数、被隔离行数，按批次号升序。行数语义与 `batch-stats`、`batch-stats-detail` 一致：`revoked` 批次按撤销前保留值输出并计入合计，`rejected` 批次成功行数为 `0`、被隔离行数为记录值；该状态无批次时汇总行计数全 `0`、无明细行。三段的批次数与行数合计与同区间 `batch-stats` 一致，各段明细与同区间同状态的 `batch-stats-detail` 一致。区间内没有任何批次时照常输出三段结构（三段汇总行均全零）、退出码 0。来源不存在、来源名非法（大小写不同的保留字面值如 `TRUE` 视为非法）、任一批次号不是正整数（零、负数拒绝）、或起始批次号大于结束批次号时，退出码 1、stderr 一行 `Error:`、stdout 无输出且数据库不变。查询不改变任何批次状态，也不影响 `show-batch`、`show-rows`、`find-dupes`、`batch-stats`、`batch-stats-detail` 的结果。
 
-五个查询均为只读：任何情况下（包括拒绝路径）都不写入或修改 `import_ledger.db`。
+`batch-reconcile <来源名> <起始批次号> <结束批次号>` 在一次只读扫描内对账两路口径：第一路为 `batch-report` 的三段汇总与明细，第二路为 `batch-stats` 的六列与 `batch-stats-detail` 的三状态明细。两路数字同出一份快照，批次号闭区间（含两端），`revoked` 批次按撤销前保留值比较，`rejected` 批次成功行数按 `0` 比较，明细按批次号升序。九项对账字段依次为 `total_batches`、`ok_batches`、`rejected_batches`、`revoked_batches`、`succeeded_rows`、`quarantined_rows`、`ok_detail`、`rejected_detail`、`revoked_detail`；汇总字段比较两路数字，明细字段比较两路明细的规范化文本——每批为批次号、成功行数、被隔离行数逗号连接，批间分号连接，按批次号升序，无明细为空串。全部一致时 stdout 输出单行 `Result: batch-reconcile <来源名> <起始批次号> <结束批次号> consistent`、退出码 0；任一对应口径不一致时，每项差异输出一行 `Mismatch: <字段> batch-report=<值> other=<值>`，差异按上述字段顺序排列，不打印一致结论，退出码 1。来源不存在、来源名非法（大小写不同的保留字面值如 `TRUE` 视为非法）、任一批次号不是正整数（零、负数拒绝）、或起始批次号大于结束批次号时，退出码 1、stderr 一行 `Error:`、stdout 无输出且数据库不变。查询为纯只读（拒绝路径同样不写入或修改 `import_ledger.db`），不改变任何批次状态，也不影响 `show-batch`、`show-rows`、`find-dupes`、`batch-stats`、`batch-stats-detail`、`batch-report` 的结果。
+
+六个查询均为只读：任何情况下（包括拒绝路径）都不写入或修改 `import_ledger.db`。

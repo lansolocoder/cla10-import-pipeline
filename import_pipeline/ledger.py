@@ -496,6 +496,119 @@ def batch_stats_detail(
     ).fetchall()
 
 
+_RECONCILE_FIELDS = (
+    "total_batches",
+    "ok_batches",
+    "rejected_batches",
+    "revoked_batches",
+    "succeeded_rows",
+    "quarantined_rows",
+    "ok_detail",
+    "rejected_detail",
+    "revoked_detail",
+)
+
+
+def _format_reconcile_detail(details: Sequence[tuple[int, int, int]]) -> str:
+    """把明细规范化为 "批次号,成功行数,被隔离行数" 逗号连接、批间分号连接的文本。"""
+    return ";".join(
+        f"{batch_no},{succeeded},{quarantined}"
+        for batch_no, succeeded, quarantined in details
+    )
+
+
+def batch_reconcile(
+    conn: sqlite3.Connection, source: str, start_batch: str, end_batch: str
+) -> list[tuple[str, str, str]]:
+    """在一次只读扫描内对账 batch-report 与 batch-stats/batch-stats-detail 两路口径。
+
+    返回按 _RECONCILE_FIELDS 顺序排列的差异列表，每项为
+    (字段名, batch-report 口径值, 另一路口径值)；两路完全一致时返回空列表。
+    汇总字段值为十进制数字字符串，明细字段值为规范化明细文本（每批批次号、
+    成功行数、被隔离行数逗号连接，批间分号连接，按批次号升序；无明细为空串）。
+    revoked 批次按撤销前保留值参与两路比较，rejected 批次成功行数按 0 比较。
+    来源不存在、来源名非法、批次号非正整数或起始批次号大于结束批次号时拒绝。
+    只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    start_no = _parse_positive_int(start_batch, "起始批次号")
+    end_no = _parse_positive_int(end_batch, "结束批次号")
+    if start_no > end_no:
+        raise LedgerError(
+            f"起始批次号不能大于结束批次号: {start_no} > {end_no}"
+        )
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    rows = conn.execute(
+        "SELECT batch_no, status, succeeded_rows, quarantined_rows FROM batches"
+        " WHERE source_name = ? AND batch_no >= ? AND batch_no <= ?"
+        " ORDER BY batch_no",
+        (source, start_no, end_no),
+    ).fetchall()
+
+    # 第一路：batch-report 三段汇总与明细（批次总数为三段批次数之和）。
+    report_sections: dict[str, list] = {
+        status: [0, 0, 0, []] for status in _REPORT_STATUSES
+    }
+    # 第二路：batch-stats 六列与 batch-stats-detail 三状态明细。
+    stats_total = 0
+    stats_counts = {"ok": 0, "rejected": 0, "revoked": 0}
+    stats_succeeded = stats_quarantined = 0
+    stats_details: dict[str, list[tuple[int, int, int]]] = {
+        status: [] for status in _REPORT_STATUSES
+    }
+
+    for batch_no, status, succeeded, quarantined in rows:
+        stats_total += 1
+        stats_succeeded += succeeded
+        stats_quarantined += quarantined
+        if status in stats_counts:
+            stats_counts[status] += 1
+            stats_details[status].append((batch_no, succeeded, quarantined))
+        section = report_sections.get(status)
+        if section is not None:
+            section[0] += 1
+            section[1] += succeeded
+            section[2] += quarantined
+            section[3].append((batch_no, succeeded, quarantined))
+
+    report_values = {
+        "total_batches": str(
+            sum(section[0] for section in report_sections.values())
+        ),
+        "ok_batches": str(report_sections["ok"][0]),
+        "rejected_batches": str(report_sections["rejected"][0]),
+        "revoked_batches": str(report_sections["revoked"][0]),
+        "succeeded_rows": str(
+            sum(section[1] for section in report_sections.values())
+        ),
+        "quarantined_rows": str(
+            sum(section[2] for section in report_sections.values())
+        ),
+        "ok_detail": _format_reconcile_detail(report_sections["ok"][3]),
+        "rejected_detail": _format_reconcile_detail(report_sections["rejected"][3]),
+        "revoked_detail": _format_reconcile_detail(report_sections["revoked"][3]),
+    }
+    stats_values = {
+        "total_batches": str(stats_total),
+        "ok_batches": str(stats_counts["ok"]),
+        "rejected_batches": str(stats_counts["rejected"]),
+        "revoked_batches": str(stats_counts["revoked"]),
+        "succeeded_rows": str(stats_succeeded),
+        "quarantined_rows": str(stats_quarantined),
+        "ok_detail": _format_reconcile_detail(stats_details["ok"]),
+        "rejected_detail": _format_reconcile_detail(stats_details["rejected"]),
+        "revoked_detail": _format_reconcile_detail(stats_details["revoked"]),
+    }
+    return [
+        (field, report_values[field], stats_values[field])
+        for field in _RECONCILE_FIELDS
+        if report_values[field] != stats_values[field]
+    ]
+
+
 def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]:
     """返回某来源指定批次的已导入行，每行为 "行号\\t规范化 JSON"。
 

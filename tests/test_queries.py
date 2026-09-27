@@ -1,12 +1,17 @@
 """Checks for the show-rows and find-dupes read-only subcommands."""
 
 from pathlib import Path
+import contextlib
 import hashlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+from import_pipeline import cli, ledger
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -623,6 +628,188 @@ class ReadonlyQueryTests(unittest.TestCase):
                 self.assertEqual(len(result.stderr.strip().splitlines()), 1)
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(self.db_digest(), self.digest_before)
+
+
+class BatchReconcileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = Path(self.tmp.name) / "import_ledger.db"
+        self.csv_path = Path(self.tmp.name) / "orders.csv"
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, IMPORT_LEDGER_DB=str(self.db_path))
+        return subprocess.run(
+            [sys.executable, "-m", "import_pipeline", *arguments],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def write_csv(self, text: str) -> None:
+        self.csv_path.write_text(text, encoding="utf-8")
+
+    def db_digest(self) -> str:
+        return hashlib.sha256(self.db_path.read_bytes()).hexdigest()
+
+    def register_orders(self) -> None:
+        result = self.invoke(
+            "add-source", "orders", str(self.csv_path), "id", "amount"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.invoke("add-mapping", "orders", "order_id", "id").returncode, 0
+        )
+        self.assertEqual(
+            self.invoke("add-mapping", "orders", "total", "amount").returncode, 0
+        )
+
+    def import_rows(self, rows: str) -> None:
+        self.write_csv(rows)
+        result = self.invoke("run-import", "orders")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_consistent_after_import_reject_revoke_scenario(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        digest_before = self.db_digest()
+        result = self.invoke("batch-reconcile", "orders", "1", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["Result: batch-reconcile orders 1 2 consistent"],
+        )
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.db_digest(), digest_before)
+
+    def test_consistent_with_all_three_statuses_and_empty_sections(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n4,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.import_rows("order_id,total\n5,50\n6,60\n7,70\n")
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        digest_before = self.db_digest()
+        for arguments in [("orders", "1", "3"), ("orders", "4", "9")]:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-reconcile", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout,
+                    f"Result: batch-reconcile {arguments[0]} {arguments[1]}"
+                    f" {arguments[2]} consistent\n",
+                )
+                self.assertEqual(self.db_digest(), digest_before)
+
+    def test_field_order_and_normalized_detail_text(self) -> None:
+        self.assertEqual(
+            ledger._RECONCILE_FIELDS,
+            (
+                "total_batches",
+                "ok_batches",
+                "rejected_batches",
+                "revoked_batches",
+                "succeeded_rows",
+                "quarantined_rows",
+                "ok_detail",
+                "rejected_detail",
+                "revoked_detail",
+            ),
+        )
+        self.assertEqual(
+            ledger._format_reconcile_detail([(1, 3, 0), (3, 2, 1)]),
+            "1,3,0;3,2,1",
+        )
+        self.assertEqual(ledger._format_reconcile_detail([]), "")
+
+    def test_mismatch_lines_rendered_in_field_order_with_exit_code_1(self) -> None:
+        # 两路实际同出一份快照，正常数据不会产生差异；这里直接构造差异列表，
+        # 校验 CLI 的逐行格式、字段顺序与退出码。
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        digest_before = self.db_digest()
+        fabricated = [
+            ("total_batches", "3", "2"),
+            ("ok_detail", "1,2,0;3,1,0", "1,2,0"),
+            ("revoked_detail", "", "4,1,0"),
+        ]
+        with mock.patch.object(
+            ledger, "batch_reconcile", return_value=fabricated
+        ), mock.patch.dict(os.environ, {"IMPORT_LEDGER_DB": str(self.db_path)}):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = cli.main(["batch-reconcile", "orders", "1", "4"])
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "Mismatch: total_batches batch-report=3 other=2",
+                "Mismatch: ok_detail batch-report=1,2,0;3,1,0 other=1,2,0",
+                "Mismatch: revoked_detail batch-report= other=4,1,0",
+            ],
+        )
+        self.assertEqual(self.db_digest(), digest_before)
+
+    def test_rejects_invalid_arguments_without_touching_database(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        digest_before = self.db_digest()
+        invalid = [
+            ("missing", "1", "2"),
+            ("TRUE", "1", "2"),
+            ("  ", "1", "2"),
+            ("orders", "0", "2"),
+            ("orders", "-1", "2"),
+            ("orders", "1", "0"),
+            ("orders", "2", "-3"),
+            ("orders", "abc", "2"),
+            ("orders", "1", "2.5"),
+            ("orders", "2", "1"),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-reconcile", *arguments)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("Error:"))
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.db_digest(), digest_before)
+
+    def test_does_not_change_other_query_results(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        commands = [
+            ("show-batch", "orders", "1"),
+            ("show-rows", "orders", "1"),
+            ("find-dupes", "orders", "amount"),
+            ("batch-stats", "orders", "1", "2"),
+            ("batch-stats-detail", "orders", "1", "2", "revoked"),
+            ("batch-report", "orders", "1", "2"),
+        ]
+        before = {command: self.invoke(*command) for command in commands}
+        reconcile = self.invoke("batch-reconcile", "orders", "1", "2")
+        self.assertEqual(reconcile.returncode, 0, reconcile.stderr)
+        for command in commands:
+            after = self.invoke(*command)
+            self.assertEqual(
+                (after.returncode, after.stdout, after.stderr),
+                (
+                    before[command].returncode,
+                    before[command].stdout,
+                    before[command].stderr,
+                ),
+                command,
+            )
 
 
 if __name__ == "__main__":
