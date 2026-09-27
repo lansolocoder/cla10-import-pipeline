@@ -381,6 +381,50 @@ def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]
     return lines
 
 
+def _parse_batch_no(value: str) -> int:
+    """解析命令行批次号；非正整数（含零、负数、非数字）一律拒绝。"""
+    try:
+        batch_no = int(value)
+    except ValueError:
+        raise LedgerError(f"批次号必须为正整数: {value}") from None
+    _validate_batch_no(batch_no)
+    return batch_no
+
+
+def batch_stats(
+    conn: sqlite3.Connection, source: str, start: str, end: str
+) -> tuple[int, int, int, int, int, int]:
+    """汇总某来源批次号区间 [start, end]（含两端）内的批次统计。
+
+    返回 (批次总数, ok 批次数, rejected 批次数, revoked 批次数,
+    成功行合计, 被隔离行合计)。revoked 批次按其保留的行数计入两个行数合计，
+    但不计入 ok 批次数。区间内无批次时返回全零。
+    来源不存在、来源名非法、批次号非正整数或起始批次号大于结束批次号时拒绝。
+    只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    start_no = _parse_batch_no(start)
+    end_no = _parse_batch_no(end)
+    if start_no > end_no:
+        raise LedgerError(f"起始批次号不能大于结束批次号: {start_no} > {end_no}")
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    row = conn.execute(
+        "SELECT COUNT(*),"
+        " COALESCE(SUM(status = 'ok'), 0),"
+        " COALESCE(SUM(status = 'rejected'), 0),"
+        " COALESCE(SUM(status = 'revoked'), 0),"
+        " COALESCE(SUM(succeeded_rows), 0),"
+        " COALESCE(SUM(quarantined_rows), 0)"
+        " FROM batches"
+        " WHERE source_name = ? AND batch_no >= ? AND batch_no <= ?",
+        (source, start_no, end_no),
+    ).fetchone()
+    return tuple(row)
+
+
 def find_dupes(
     conn: sqlite3.Connection, source: str, target_column: str
 ) -> list[tuple[str, int, list[int]]]:
