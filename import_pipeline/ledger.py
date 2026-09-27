@@ -96,6 +96,21 @@ def _validate_batch_no(batch_no: int) -> None:
         raise LedgerError(f"批次号必须为正整数: {batch_no}")
 
 
+def _parse_positive_int(value: object, label: str) -> int:
+    """把命令行传入的批次号解析为正整数；非十进制正整数按业务规则拒绝。"""
+    if isinstance(value, bool):
+        raise LedgerError(f"{label}必须为正整数: {value}")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        number = int(value)
+    else:
+        raise LedgerError(f"{label}必须为正整数: {value}")
+    if number <= 0:
+        raise LedgerError(f"{label}必须为正整数: {value}")
+    return number
+
+
 def add_source(
     conn: sqlite3.Connection, name: str, csv_path: str, fields: Sequence[str]
 ) -> int:
@@ -345,6 +360,54 @@ def show_batches(
         " ORDER BY batch_no",
         (source, batch_no),
     ).fetchall()
+
+
+def batch_stats(
+    conn: sqlite3.Connection, source: str, start_batch: str, end_batch: str
+) -> tuple[int, int, int, int, int, int]:
+    """汇总某来源批次号闭区间 [start_batch, end_batch] 内各状态的批次统计。
+
+    返回 (批次总数, ok 批次数, rejected 批次数, revoked 批次数,
+    成功行合计, 被隔离行合计)。区间内没有任何批次时返回全零元组。
+    revoked 批次不计入 ok 批次数，但其成功行数与被隔离行数按撤销前保留值
+    计入两个行数合计。来源不存在、来源名非法、批次号非正整数或
+    起始批次号大于结束批次号时拒绝。只读操作，不落库。
+    """
+    _validate_token(source, "来源名")
+    start_no = _parse_positive_int(start_batch, "起始批次号")
+    end_no = _parse_positive_int(end_batch, "结束批次号")
+    if start_no > end_no:
+        raise LedgerError(
+            f"起始批次号不能大于结束批次号: {start_no} > {end_no}"
+        )
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    rows = conn.execute(
+        "SELECT status, succeeded_rows, quarantined_rows FROM batches"
+        " WHERE source_name = ? AND batch_no >= ? AND batch_no <= ?",
+        (source, start_no, end_no),
+    ).fetchall()
+    total = len(rows)
+    ok = rejected = revoked = succeeded_total = quarantined_total = 0
+    for status, succeeded, quarantined in rows:
+        if status == "ok":
+            ok += 1
+        elif status == "rejected":
+            rejected += 1
+        elif status == "revoked":
+            revoked += 1
+        succeeded_total += succeeded
+        quarantined_total += quarantined
+    return (
+        total,
+        ok,
+        rejected,
+        revoked,
+        succeeded_total,
+        quarantined_total,
+    )
 
 
 def show_rows(conn: sqlite3.Connection, source: str, batch_no: int) -> list[str]:

@@ -66,6 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     find_dupes.add_argument("source", help="已注册的来源名")
     find_dupes.add_argument("target_column", help="目标列名")
 
+    batch_stats = subparsers.add_parser(
+        "batch-stats", help="跨批次状态汇总: 来源名 起始批次号 结束批次号"
+    )
+    batch_stats.add_argument("source", help="已注册的来源名")
+    batch_stats.add_argument("start_batch", help="起始批次号（含，正整数）")
+    batch_stats.add_argument("end_batch", help="结束批次号（含，正整数）")
+
     return parser
 
 
@@ -76,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    readonly = args.command in ("show-rows", "find-dupes")
+    readonly = args.command in ("show-rows", "find-dupes", "batch-stats")
     conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
         if args.command == "add-source":
@@ -113,6 +120,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ):
                 batches = ",".join(str(batch_no) for batch_no in batch_numbers)
                 print(f"{value}\t{count}\t{batches}")
+        elif args.command == "batch-stats":
+            stats = ledger.batch_stats(
+                conn, args.source, args.start_batch, args.end_batch
+            )
+            print("\t".join(str(value) for value in stats))
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
