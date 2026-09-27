@@ -289,6 +289,153 @@ class ReadonlyQueryTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(self.db_digest(), self.digest_before)
 
+    def test_batch_stats_detail_lists_matching_status_batches(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.import_rows("order_id,total\n3,30\n4,40\n5,50\n")
+        self.digest_before = self.db_digest()
+        result = self.invoke("batch-stats-detail", "orders", "1", "2", "ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(), ["1\t2\t0", "2\t3\t0"]
+        )
+        self.assert_readonly(result)
+
+    def test_batch_stats_detail_revoke_then_reject_scenario(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        self.digest_before = self.db_digest()
+        revoked = self.invoke("batch-stats-detail", "orders", "1", "2", "revoked")
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        self.assertEqual(revoked.stdout.splitlines(), ["1\t2\t0"])
+        rejected = self.invoke("batch-stats-detail", "orders", "1", "2", "rejected")
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(rejected.stdout.splitlines(), ["2\t0\t1"])
+        ok = self.invoke("batch-stats-detail", "orders", "1", "2", "ok")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(ok.stdout, "")
+        self.assertEqual(self.db_digest(), self.digest_before)
+
+    def test_batch_stats_detail_range_bounds_are_inclusive(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.import_rows("order_id,total\n2,20\n")
+        self.import_rows("order_id,total\n3,30\n")
+        result = self.invoke("batch-stats-detail", "orders", "2", "2", "ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["2\t1\t0"])
+        result = self.invoke("batch-stats-detail", "orders", "2", "9", "ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(), ["2\t1\t0", "3\t1\t0"]
+        )
+
+    def test_batch_stats_detail_no_matching_status_is_empty(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.write_csv("order_id,total\n2,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.digest_before = self.db_digest()
+        for arguments in [
+            ("orders", "1", "2", "revoked"),
+            ("orders", "1", "1", "rejected"),
+            ("orders", "9", "100", "ok"),
+        ]:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-stats-detail", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.db_digest(), self.digest_before)
+
+    def test_batch_stats_detail_totals_match_batch_stats(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.import_rows("order_id,total\n3,30\n4,40\n")
+        self.write_csv("order_id,total\n5,\n6,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        stats = self.invoke("batch-stats", "orders", "1", "3")
+        self.assertEqual(stats.returncode, 0, stats.stderr)
+        total, ok_count, rejected_count, revoked_count, succeeded_sum, quarantined_sum = (
+            int(value) for value in stats.stdout.split("\t")
+        )
+        counts = {"ok": ok_count, "rejected": rejected_count, "revoked": revoked_count}
+        succeeded_agg = quarantined_agg = detail_rows = 0
+        for status in ("ok", "rejected", "revoked"):
+            result = self.invoke("batch-stats-detail", "orders", "1", "3", status)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            self.assertEqual(len(lines), counts[status])
+            detail_rows += len(lines)
+            for line in lines:
+                succeeded, quarantined = (int(value) for value in line.split("\t")[1:])
+                succeeded_agg += succeeded
+                quarantined_agg += quarantined
+        self.assertEqual(detail_rows, total)
+        self.assertEqual(succeeded_agg, succeeded_sum)
+        self.assertEqual(quarantined_agg, quarantined_sum)
+
+    def test_batch_stats_detail_does_not_change_other_query_results(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n2,20\n")
+        self.write_csv("order_id,total\n3,\n")
+        self.assertEqual(self.invoke("run-import", "orders").returncode, 1)
+        self.assertEqual(self.invoke("revoke-batch", "orders", "1").returncode, 0)
+        commands = [
+            ("show-batch", "orders", "1"),
+            ("show-rows", "orders", "1"),
+            ("find-dupes", "orders", "amount"),
+            ("batch-stats", "orders", "1", "2"),
+        ]
+        before = {
+            command: self.invoke(*command) for command in commands
+        }
+        detail = self.invoke("batch-stats-detail", "orders", "1", "2", "revoked")
+        self.assertEqual(detail.returncode, 0, detail.stderr)
+        for command in commands:
+            after = self.invoke(*command)
+            self.assertEqual(
+                (after.returncode, after.stdout, after.stderr),
+                (
+                    before[command].returncode,
+                    before[command].stdout,
+                    before[command].stderr,
+                ),
+                command,
+            )
+
+    def test_batch_stats_detail_rejects_invalid_arguments(self) -> None:
+        self.register_orders()
+        self.import_rows("order_id,total\n1,10\n")
+        self.digest_before = self.db_digest()
+        invalid = [
+            ("missing", "1", "2", "ok"),
+            ("TRUE", "1", "2", "ok"),
+            ("  ", "1", "2", "ok"),
+            ("orders", "0", "2", "ok"),
+            ("orders", "-1", "2", "ok"),
+            ("orders", "1", "0", "ok"),
+            ("orders", "2", "-3", "ok"),
+            ("orders", "abc", "2", "ok"),
+            ("orders", "1", "2.5", "ok"),
+            ("orders", "2", "1", "ok"),
+            ("orders", "1", "2", "OK"),
+            ("orders", "1", "2", "failed"),
+            ("orders", "1", "2", ""),
+            ("orders", "1", "2", "ok "),
+        ]
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.invoke("batch-stats-detail", *arguments)
+                self.assertEqual(result.returncode, 1)
+                self.assertTrue(result.stderr.startswith("Error:"))
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(self.db_digest(), self.digest_before)
+
 
 if __name__ == "__main__":
     unittest.main()

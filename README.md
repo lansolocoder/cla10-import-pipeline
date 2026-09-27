@@ -67,6 +67,10 @@ python3 -m import_pipeline find-dupes orders amount
 # 输出一行：批次总数、ok 批次数、rejected 批次数、revoked 批次数、
 # 成功行合计、被隔离行合计（制表符分隔）
 python3 -m import_pipeline batch-stats orders 1 3
+
+# 只读查询：输出区间内指定状态批次的明细，
+# 每行：批次号、成功行数、被隔离行数（制表符分隔，按批次号升序）
+python3 -m import_pipeline batch-stats-detail orders 1 3 ok
 ```
 
 `show-rows` 仅 `ok` 批次有行；`rejected` 批次本无行、`revoked` 批次的行已在撤销时删除，两者均输出为空且退出码 0。来源名或批次号不存在时退出码 1、stderr 一行 `Error:`、stdout 无输出；批次号校验沿用既有规则（正整数，零或负数拒绝）。
@@ -75,4 +79,6 @@ python3 -m import_pipeline batch-stats orders 1 3
 
 `batch-stats <来源名> <起始批次号> <结束批次号>` 在一次只读扫描里汇总批次号闭区间（含两端）内的批次：输出一行六个制表符分隔的十进制数字，依次为批次总数、`ok` 批次数、`rejected` 批次数、`revoked` 批次数、成功行合计、被隔离行合计。成功行合计与被隔离行合计为区间内各批次记录值之和；`revoked` 批次按撤销时保留的撤销前数值计入两个行数合计，但不计入 `ok` 批次数。区间内没有任何批次时输出一行全零（六列均为 `0`）、退出码 0。来源不存在、来源名非法（非空校验沿用现有规则，大小写不同的保留字面值如 `TRUE` 视为非法）、任一一个批次号不是正整数（零、负数拒绝）、或起始批次号大于结束批次号时，退出码 1、stderr 一行 `Error:`、stdout 无输出。查询本身不改变任何批次状态，也不影响后续 `show-batch`、`show-rows`、`find-dupes` 的结果。
 
-三个查询均为只读：任何情况下（包括拒绝路径）都不写入或修改 `import_ledger.db`。
+`batch-stats-detail <来源名> <起始批次号> <结束批次号> <状态>` 在一次只读扫描里输出批次号闭区间（含两端）内指定状态批次的明细：每行三个制表符分隔的十进制数字，依次为批次号、成功行数、被隔离行数，按批次号升序。状态只接受小写 `ok`、`rejected`、`revoked`；`revoked` 批次沿用撤销时保留的撤销前数值原样输出两个行数，`rejected` 批次输出其记录的被隔离行数、成功行数为 `0`。每行的状态与两个行数来自同一次只读扫描的一致快照，因此同一区间同一状态的明细行数等于 `batch-stats` 中该状态批次数、明细两个行数合计等于 `batch-stats` 对应状态的行数合计。区间内没有任何该状态的批次（包括区间内有批次但都不是所查状态）时输出为空、退出码 0。来源不存在、来源名非法、任一批次号不是正整数、起始批次号大于结束批次号或状态取值非法（如 `OK`、未知状态）时，退出码 1、stderr 一行 `Error:`、stdout 无输出。查询不改变任何批次状态，也不影响 `show-batch`、`show-rows`、`find-dupes`、`batch-stats` 的结果。
+
+四个查询均为只读：任何情况下（包括拒绝路径）都不写入或修改 `import_ledger.db`。

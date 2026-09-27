@@ -73,6 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
     batch_stats.add_argument("start_batch", help="起始批次号（含，正整数）")
     batch_stats.add_argument("end_batch", help="结束批次号（含，正整数）")
 
+    batch_stats_detail = subparsers.add_parser(
+        "batch-stats-detail",
+        help="区间内指定状态批次明细: 来源名 起始批次号 结束批次号 状态",
+    )
+    batch_stats_detail.add_argument("source", help="已注册的来源名")
+    batch_stats_detail.add_argument("start_batch", help="起始批次号（含，正整数）")
+    batch_stats_detail.add_argument("end_batch", help="结束批次号（含，正整数）")
+    batch_stats_detail.add_argument(
+        "status", help="批次状态（只接受小写 ok、rejected、revoked）"
+    )
+
     return parser
 
 
@@ -83,7 +94,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    readonly = args.command in ("show-rows", "find-dupes", "batch-stats")
+    readonly = args.command in (
+        "show-rows",
+        "find-dupes",
+        "batch-stats",
+        "batch-stats-detail",
+    )
     conn = ledger.connect_readonly() if readonly else ledger.connect()
     try:
         if args.command == "add-source":
@@ -125,6 +141,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn, args.source, args.start_batch, args.end_batch
             )
             print("\t".join(str(value) for value in stats))
+        elif args.command == "batch-stats-detail":
+            for batch_no, succeeded, quarantined in ledger.batch_stats_detail(
+                conn, args.source, args.start_batch, args.end_batch, args.status
+            ):
+                print(f"{batch_no}\t{succeeded}\t{quarantined}")
     except ledger.LedgerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
