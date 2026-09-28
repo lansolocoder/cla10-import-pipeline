@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_import.add_argument("source", help="已注册的来源名")
 
+    batch_import = subparsers.add_parser(
+        "batch-import",
+        help="把多个 CSV 合并为同一来源的单个批次:"
+        " 来源名 CSV路径 CSV路径 [CSV路径...]",
+    )
+    batch_import.add_argument("source", help="已注册的来源名")
+    batch_import.add_argument(
+        "csv_paths", nargs="+", help="CSV 文件路径（至少两个，按给定顺序合并）"
+    )
+
     show_batch = subparsers.add_parser(
         "show-batch", help="查询批次记录: 来源名 批次号"
     )
@@ -139,6 +149,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "run-import":
             count = ledger.run_import(conn, args.source)
             print(f"Result: run-import {args.source} {count}")
+        elif args.command == "batch-import":
+            count = ledger.batch_import(conn, args.source, args.csv_paths)
+            print(f"Result: batch-import {args.source} {count}")
         elif args.command == "revoke-batch":
             ledger.revoke_batch(conn, args.source, args.batch_no)
             print(f"Result: revoke-batch {args.source} {args.batch_no}")

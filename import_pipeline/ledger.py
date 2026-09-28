@@ -216,6 +216,20 @@ def _record_batch(
     return batch_no
 
 
+def _read_csv_rows(csv_path: str) -> list[list[str]]:
+    """读取整个 CSV 为行列表；文件缺失或不可读时按业务错误抛出。
+
+    调用方在任何事务之前调用，因此这类失败不留批次记录。
+    """
+    if not Path(csv_path).is_file():
+        raise LedgerError(f"CSV 文件不存在: {csv_path}")
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            return list(csv.reader(handle))
+    except (OSError, UnicodeError) as exc:
+        raise LedgerError(f"CSV 文件读取失败: {csv_path}: {exc}") from exc
+
+
 def run_import(conn: sqlite3.Connection, source: str) -> int:
     """执行一次导入，返回成功行数。
 
@@ -228,8 +242,6 @@ def run_import(conn: sqlite3.Connection, source: str) -> int:
     if row is None:
         raise LedgerError(f"来源不存在: {source}")
     csv_path = row[0]
-    if not Path(csv_path).is_file():
-        raise LedgerError(f"CSV 文件不存在: {csv_path}")
 
     mappings = list_mappings(conn, source)
     target_by_source = dict(mappings)
@@ -242,11 +254,7 @@ def run_import(conn: sqlite3.Connection, source: str) -> int:
         )
     ]
 
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as handle:
-            rows = list(csv.reader(handle))
-    except OSError as exc:
-        raise LedgerError(f"CSV 文件读取失败: {csv_path}: {exc}") from exc
+    rows = _read_csv_rows(csv_path)
 
     header: list[str] | None = rows[0] if rows else None
     data_rows = rows[1:] if rows else []
@@ -300,6 +308,113 @@ def run_import(conn: sqlite3.Connection, source: str) -> int:
             ],
         )
     return len(data_rows)
+
+
+def batch_import(
+    conn: sqlite3.Connection, source: str, csv_paths: Sequence[str]
+) -> int:
+    """把同一来源的多个 CSV 合并为单个批次导入，返回成功行数。
+
+    文件按参数顺序读取：每个文件首行为表头，数据行按已登记字段映射落库，
+    行号跨文件连续分配（从 1 起）。表头列名集合必须一致。
+    文件少于两个、文件缺失/不可读、缺表头或表头含空白列名时不留批次记录；
+    映射/必需字段/数据行校验失败时整批拒绝，登记 rejected 批次
+    （被隔离行数为全部文件数据行总数），已校验行不落库。
+    成功时全部数据行与 ok 批次在同一事务内原子落库。
+    """
+    if len(csv_paths) < 2:
+        raise LedgerError("batch-import 至少需要两个 CSV 文件")
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone() is None:
+        raise LedgerError(f"来源不存在: {source}")
+
+    # 文件级失败发生在任何事务之前：不留批次记录，数据库保持执行前状态。
+    files: list[tuple[list[str], list[list[str]]]] = []
+    for csv_path in csv_paths:
+        rows = _read_csv_rows(csv_path)
+        if not rows:
+            raise LedgerError(f"CSV 文件缺少表头: {csv_path}")
+        header, data_rows = rows[0], rows[1:]
+        for column in header:
+            if not column or not column.strip():
+                raise LedgerError(f"CSV 表头含空白列名: {csv_path}")
+        files.append((header, data_rows))
+
+    first_header = files[0][0]
+    first_set = set(first_header)
+    for index, (header, _) in enumerate(files[1:], start=2):
+        if set(header) != first_set:
+            raise LedgerError(f"第 {index} 个文件表头列名集合不一致")
+
+    mappings = list_mappings(conn, source)
+    target_by_source = dict(mappings)
+    required_fields = [
+        r[0]
+        for r in conn.execute(
+            "SELECT field_name FROM source_fields WHERE source_name = ?"
+            " ORDER BY rowid",
+            (source,),
+        )
+    ]
+
+    total_data_rows = sum(len(data_rows) for _, data_rows in files)
+
+    error: str | None = None
+    for column in first_header:
+        if column not in target_by_source:
+            error = f"未映射的源列: {column}"
+            break
+    if error is None:
+        produced = {target_by_source[column] for column in first_header}
+        for field in required_fields:
+            if field not in produced:
+                error = f"缺少映射目标对应列: {field}"
+                break
+    if error is None:
+        for _, data_rows in files:
+            for data_row in data_rows:
+                if len(data_row) != len(first_header) or any(
+                    not value.strip() for value in data_row
+                ):
+                    error = "数据行含空白值"
+                    break
+            if error is not None:
+                break
+
+    if error is not None:
+        with conn:  # 拒绝也留批次记录；已校验行不落库
+            _record_batch(conn, source, "rejected", 0, total_data_rows)
+        raise LedgerError(error)
+
+    records: list[tuple[int, str]] = []
+    row_number = 0
+    for header, data_rows in files:
+        for data_row in data_rows:
+            row_number += 1
+            records.append(
+                (
+                    row_number,
+                    json.dumps(
+                        {
+                            target_by_source[column]: value
+                            for column, value in zip(header, data_row)
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+
+    with conn:  # 多文件数据行与批次记录原子提交，中途失败整体回滚
+        batch_no = _record_batch(conn, source, "ok", total_data_rows, 0)
+        conn.executemany(
+            "INSERT INTO imported_rows"
+            " (source_name, batch_no, row_number, data) VALUES (?, ?, ?, ?)",
+            [
+                (source, batch_no, number, data) for number, data in records
+            ],
+        )
+    return total_data_rows
 
 
 def revoke_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> None:
