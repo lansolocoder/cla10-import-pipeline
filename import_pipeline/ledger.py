@@ -302,6 +302,134 @@ def run_import(conn: sqlite3.Connection, source: str) -> int:
     return len(data_rows)
 
 
+def _read_csv_rows(csv_path: str) -> list[list[str]]:
+    """读取整个 CSV 文件为行列表；不存在或无法读取时抛 LedgerError。"""
+    if not Path(csv_path).is_file():
+        raise LedgerError(f"CSV 文件不存在: {csv_path}")
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            return list(csv.reader(handle))
+    except (OSError, UnicodeError, csv.Error) as exc:
+        raise LedgerError(f"CSV 文件读取失败: {csv_path}: {exc}") from exc
+
+
+def _load_mappings_and_fields(
+    conn: sqlite3.Connection, source: str
+) -> tuple[dict[str, str], list[str]]:
+    """取来源的 源列->目标列 映射与必需字段列表；来源不存在时拒绝。"""
+    if not conn.execute(
+        "SELECT 1 FROM sources WHERE name = ?", (source,)
+    ).fetchone():
+        raise LedgerError(f"来源不存在: {source}")
+    target_by_source = dict(list_mappings(conn, source))
+    required_fields = [
+        r[0]
+        for r in conn.execute(
+            "SELECT field_name FROM source_fields WHERE source_name = ?"
+            " ORDER BY rowid",
+            (source,),
+        )
+    ]
+    return target_by_source, required_fields
+
+
+def batch_import(
+    conn: sqlite3.Connection, source: str, csv_paths: Sequence[str]
+) -> int:
+    """把同一来源的多个 CSV 按给定顺序合并为单个批次导入，返回成功行数。
+
+    行号按文件参数顺序、文件内行序从 1 连续分配；批次号仍为来源内从 1 递增。
+    文件少于两个、任一文件不存在或无法读取、缺表头、表头含空白列名或两个文件
+    表头列名集合不一致时直接拒绝且不留批次记录；映射与数据校验沿用 run-import，
+    失败时登记 rejected 批次（被隔离行数为全部文件数据行总数），已校验行不落库。
+    成功时全部数据行与 ok 批次在同一事务内落库，中途失败整体回滚。
+    """
+    _validate_token(source, "来源名")
+    if len(csv_paths) < 2:
+        raise LedgerError("batch-import 至少需要两个 CSV 文件")
+    target_by_source, required_fields = _load_mappings_and_fields(conn, source)
+
+    # 预检阶段：先把全部文件读入并做结构性校验，任何失败都不写库、不留批次。
+    parsed: list[tuple[list[str], list[list[str]]]] = []
+    total_data_rows = 0
+    for csv_path in csv_paths:
+        rows = _read_csv_rows(csv_path)
+        if not rows:
+            raise LedgerError(f"CSV 文件缺少表头: {csv_path}")
+        header, data_rows = rows[0], rows[1:]
+        for column in header:
+            if not column.strip():
+                raise LedgerError(f"CSV 表头含空白列名: {csv_path}")
+        parsed.append((header, data_rows))
+        total_data_rows += len(data_rows)
+
+    first_header = parsed[0][0]
+    first_columns = set(first_header)
+    for index, (header, _) in enumerate(parsed[1:], start=2):
+        if set(header) != first_columns:
+            raise LedgerError(
+                f"CSV 表头列名集合不一致: {csv_paths[index - 1]}"
+            )
+
+    # 业务校验阶段：映射与数据值规则沿用 run-import，失败登记 rejected 批次。
+    error: str | None = None
+    for column in first_header:
+        if column not in target_by_source:
+            error = f"未映射的源列: {column}"
+            break
+    if error is None:
+        produced = {target_by_source[column] for column in first_header}
+        for field in required_fields:
+            if field not in produced:
+                error = f"缺少映射目标对应列: {field}"
+                break
+    if error is None:
+        for header, data_rows in parsed:
+            for data_row in data_rows:
+                if len(data_row) != len(header) or any(
+                    not value.strip() for value in data_row
+                ):
+                    error = "数据行含空白值"
+                    break
+            if error is not None:
+                break
+
+    if error is not None:
+        with conn:  # 拒绝也留批次记录；已校验行不落库
+            _record_batch(conn, source, "rejected", 0, total_data_rows)
+        raise LedgerError(error)
+
+    records: list[tuple[int, str]] = []
+    row_number = 0
+    for header, data_rows in parsed:
+        for data_row in data_rows:
+            row_number += 1
+            records.append(
+                (
+                    row_number,
+                    json.dumps(
+                        {
+                            target_by_source[column]: value
+                            for column, value in zip(header, data_row)
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+
+    with conn:  # 全部数据行与批次记录原子提交，异常即整体回滚
+        batch_no = _record_batch(conn, source, "ok", len(records), 0)
+        conn.executemany(
+            "INSERT INTO imported_rows"
+            " (source_name, batch_no, row_number, data) VALUES (?, ?, ?, ?)",
+            [
+                (source, batch_no, row_number, data)
+                for row_number, data in records
+            ],
+        )
+    return len(records)
+
+
 def revoke_batch(conn: sqlite3.Connection, source: str, batch_no: int) -> None:
     """撤销某来源指定批次号的单个 ok 批次。
 
